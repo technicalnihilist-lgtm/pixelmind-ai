@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.1 — model survey
+
+* `docs/MODEL_OPTIONS.md`: every pre-exported ONNX text-to-image model that fits this app's tensor
+  contract, with measured sizes and load-test results. Documents why a 300 MB diffusion model does
+  not exist and why the one 618 MB export is unusable.
+* `tools/repair_onnx.py`: repairs duplicate tensor definitions in quantised ONNX exports (50 of 50
+  found in `szFangshi/tiny-sd-int8`), and reports the deeper defect that makes that particular
+  model unrecoverable.
+* No app code changes; the shipped APK is unchanged.
+
 ## 1.1.0
 
 * Ships a runnable **verification model** (8.2 MB) so the APK generates images out of the box:

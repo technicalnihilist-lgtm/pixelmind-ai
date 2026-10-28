@@ -26,7 +26,7 @@ verified and what is not.
 | Real ONNX inference code (no mocks, no stock images) | **Implemented** — CLIP BPE tokenizer, LCM scheduler, UNet/VAE graph execution. |
 | Weights bundled in the APK | **Yes** — the *verification* model (8.2 MB): real ONNX graphs with the same shapes as the SD pipeline, untrained weights. |
 | Image generation works in the shipped APK | **Yes, end to end** — tokenizer → conditioning → 4 LCM steps → VAE → PNG, on device, offline. Output is smooth abstract colour fields, **not** photoreal imagery. |
-| Photoreal / SD-quality output | **No.** Needs the 600 MB Stable Diffusion export: `tools/export_model.py`. The app code does not change. |
+| Photoreal / SD-quality output | **No.** Needs the Stable Diffusion export: `tools/export_model.py`. No public pre-exported model below ~950 MB is usable — see [docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md). |
 | Tested on a physical device | **Not done.** No Android hardware was available to this build. |
 | Airplane-mode generation verified | **Not done** (depends on the two rows above). |
 | Screenshots | The images in `design/` are **UI renders produced from the Compose layout**, not device screenshots. |
@@ -48,6 +48,11 @@ Anything below marked "measured" was measured on the build machine described in
 The shipped APK generates images today. It does not pretend they are photographs: the weights are
 untrained, so what comes out is prompt-dependent abstract colour — honest output from a real
 pipeline rather than a stock image presented as AI.
+
+Every pre-exported ONNX alternative was surveyed, measured and load-tested; the results (including
+one widely-mirrored "int8" export that is structurally broken) are in
+**[docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md)**. Short version: nothing usable exists below
+~950 MB, and a 300 MB diffusion model does not exist at all.
 
 Swapping in the real model is a build step, not a code change:
 
@@ -104,6 +109,7 @@ Full detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `tools/export_model.py` | Exports + quantises Stable Diffusion 1.5 + LCM into the ONNX graphs this app loads |
 | `tools/make_tiny_model.py` | Builds the 8 MB verification model that ships in the APK |
 | `tools/smoke_test_model.py` | Runs the whole pipeline in Python against any model directory |
+| `tools/repair_onnx.py` | Diagnoses and repairs duplicate-tensor-definition bugs in third-party quantised exports |
 
 ## Build
 
