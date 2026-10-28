@@ -29,6 +29,20 @@ data class GenerationProgress(
         }
 }
 
+/** Where the wall-clock time went, measured on the device. Shown in the UI, not just logged. */
+data class RunTimings(
+    val accelerator: String,
+    val textEncodeMs: Long,
+    val diffusionMs: Long,
+    val decodeMs: Long,
+    val steps: Int,
+    val width: Int,
+    val height: Int
+) {
+    val perStepMs: Long get() = if (steps > 0) diffusionMs / steps else 0
+    val totalMs: Long get() = textEncodeMs + diffusionMs + decodeMs
+}
+
 data class GeneratedImage(
     val file: File,
     val width: Int,
@@ -38,7 +52,7 @@ data class GeneratedImage(
 )
 
 sealed interface GenerationResult {
-    data class Success(val image: GeneratedImage) : GenerationResult
+    data class Success(val image: GeneratedImage, val timings: RunTimings? = null) : GenerationResult
     data class Failed(val reason: String, val cause: Throwable? = null) : GenerationResult
     data object Cancelled : GenerationResult
 }

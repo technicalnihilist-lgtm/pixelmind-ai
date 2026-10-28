@@ -60,7 +60,10 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
             Eyebrow("Local model")
             Spacer(Modifier.height(12.dp))
             StatRow("Name", modelInfo?.name ?: "Not loaded")
-            StatRow("Version", modelInfo?.version ?: "—")
+            // The manifest version (0.1.0 for the verification model) is the *model* build, not
+            // the app version — labelling it "Version" invited exactly that confusion.
+            StatRow("Model build", modelInfo?.version ?: "—")
+            StatRow("Model type", modelType(modelInfo?.name))
             StatRow("Architecture", modelInfo?.architecture ?: "—")
             StatRow("Precision", modelInfo?.precision?.uppercase() ?: "—")
             StatRow("Recommended steps", modelInfo?.stepsRecommended?.toString() ?: "—")
@@ -179,7 +182,7 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
         GlassCard(isDark = isDark) {
             Eyebrow("About")
             Spacer(Modifier.height(12.dp))
-            StatRow("PixelMind AI", BuildConfig.VERSION_NAME)
+            StatRow("App version", BuildConfig.VERSION_NAME)
             StatRow("Build", BuildConfig.BUILD_TYPE)
             Spacer(Modifier.height(8.dp))
             Text(
@@ -192,6 +195,13 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
 
         Spacer(Modifier.height(110.dp))
     }
+}
+
+private fun modelType(name: String?): String = when {
+    name == null -> "—"
+    name.contains("Tiny", ignoreCase = true) || name.contains("verification", ignoreCase = true) ->
+        "Verification (untrained weights)"
+    else -> "Production"
 }
 
 private fun formatBytes(bytes: Long): String = when {

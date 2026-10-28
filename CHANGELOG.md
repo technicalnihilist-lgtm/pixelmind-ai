@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.4 — timings on screen, clearer model versioning
+
+* **Generation timing is now shown in the app.** Studio reports where the wall clock went —
+  prompt encoding, per-step diffusion, VAE decode, and which accelerator ran it. No `adb` needed.
+* Settings distinguishes **"Model build"** (the manifest's own version, 0.1.0 for the verification
+  model) from **"App version"**. Labelling the model's version simply as "Version" made it look
+  like an out-of-date app.
+* Settings also names the model type: *Verification (untrained weights)* or *Production*.
+
+
 ## 1.1.3 — generation no longer stalls
 
 Reported from a device: progress froze at 5% for over a minute. 5% is the text-encoding stage, so

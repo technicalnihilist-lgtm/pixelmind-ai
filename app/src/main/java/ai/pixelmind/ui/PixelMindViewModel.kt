@@ -10,6 +10,7 @@ import ai.pixelmind.engine.GenerationRequest
 import ai.pixelmind.engine.GenerationResult
 import ai.pixelmind.engine.ModelInfo
 import ai.pixelmind.engine.QualityTier
+import ai.pixelmind.engine.RunTimings
 import ai.pixelmind.engine.StylePreset
 import ai.pixelmind.manager.GenerationManager
 import ai.pixelmind.ui.theme.ThemeMode
@@ -67,6 +68,9 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
     private val _lastImage = MutableStateFlow<String?>(null)
     val lastImage: StateFlow<String?> = _lastImage.asStateFlow()
 
+    private val _lastTimings = MutableStateFlow<RunTimings?>(null)
+    val lastTimings: StateFlow<RunTimings?> = _lastTimings.asStateFlow()
+
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message.asStateFlow()
 
@@ -85,7 +89,10 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             manager.resultEvents.collect { result ->
                 when (result) {
-                    is GenerationResult.Success -> _lastImage.value = result.image.file.absolutePath
+                    is GenerationResult.Success -> {
+                        _lastImage.value = result.image.file.absolutePath
+                        _lastTimings.value = result.timings
+                    }
                     is GenerationResult.Failed -> _message.value = result.reason
                     GenerationResult.Cancelled -> _message.value = "Generation cancelled."
                 }

@@ -210,6 +210,7 @@ class OnnxDiffusionEngine(
                 Log.i(TAG, "text encoding took ${SystemClock.elapsedRealtime() - textStarted} ms")
 
                 // ---- 2. Diffusion loop ----------------------------------------------------
+                val textDone = SystemClock.elapsedRealtime()
                 val timesteps = scheduler.timesteps(fitted.steps)
                 val latentH = fitted.height / 8
                 val latentW = fitted.width / 8
@@ -241,6 +242,7 @@ class OnnxDiffusionEngine(
 
                 // ---- 3. Decode --------------------------------------------------------------
                 onProgress(GenerationProgress(GenerationStage.DECODING, fitted.steps, fitted.steps, elapsed(started)))
+                val diffusionDone = SystemClock.elapsedRealtime()
                 val decodeStarted = SystemClock.elapsedRealtime()
                 val bitmap = decodeLatents(envLocal, vae, m, latent!!, fitted.width, fitted.height)
                 Log.i(TAG, "vae decode took ${SystemClock.elapsedRealtime() - decodeStarted} ms")
@@ -252,13 +254,23 @@ class OnnxDiffusionEngine(
                 bitmap.recycle()
                 onProgress(GenerationProgress(GenerationStage.DONE, fitted.steps, fitted.steps, elapsed(started)))
 
+                val decodeDone = SystemClock.elapsedRealtime()
                 GenerationResult.Success(
-                    GeneratedImage(
+                    image = GeneratedImage(
                         file = file,
                         width = fitted.width,
                         height = fitted.height,
                         seed = seed,
                         durationMs = elapsed(started)
+                    ),
+                    timings = RunTimings(
+                        accelerator = accelerator,
+                        textEncodeMs = textDone - textStarted,
+                        diffusionMs = diffusionDone - textDone,
+                        decodeMs = decodeDone - diffusionDone,
+                        steps = fitted.steps,
+                        width = fitted.width,
+                        height = fitted.height
                     )
                 )
             } catch (c: kotlinx.coroutines.CancellationException) {

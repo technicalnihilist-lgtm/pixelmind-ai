@@ -36,6 +36,7 @@ import ai.pixelmind.engine.AspectRatio
 import ai.pixelmind.engine.EngineStatus
 import ai.pixelmind.engine.GenerationProgress
 import ai.pixelmind.engine.GenerationStage
+import ai.pixelmind.engine.RunTimings
 import ai.pixelmind.engine.QualityTier
 import ai.pixelmind.engine.StylePreset
 import ai.pixelmind.manager.GenerationManager
@@ -61,6 +62,7 @@ fun StudioScreen(viewModel: PixelMindViewModel) {
     val jobs by viewModel.jobs.collectAsState()
     val status by viewModel.engineStatus.collectAsState()
     val lastImage by viewModel.lastImage.collectAsState()
+    val timings by viewModel.lastTimings.collectAsState()
 
     val activeJob = jobs.lastOrNull {
         it.state == GenerationManager.JobState.RUNNING || it.state == GenerationManager.JobState.QUEUED
@@ -313,12 +315,35 @@ fun StudioScreen(viewModel: PixelMindViewModel) {
                     cornerRadius = Radii.card,
                     contentDescription = studio.prompt
                 )
+                timings?.let { t ->
+                    Spacer(Modifier.height(12.dp))
+                    GlassCard(isDark = isDark, padding = PaddingValues(14.dp)) {
+                        Eyebrow("Measured on this device")
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Prompt ${formatMs(t.textEncodeMs)} · ${t.steps} steps " +
+                                "${formatMs(t.diffusionMs)} (${t.perStepMs} ms each) · " +
+                                "decode ${formatMs(t.decodeMs)}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "${t.width}×${t.height} on ${t.accelerator} · total ${formatMs(t.totalMs)}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Palette.Mint
+                        )
+                    }
+                }
             }
         }
 
         Spacer(Modifier.height(110.dp))
     }
 }
+
+private fun formatMs(ms: Long): String =
+    if (ms < 1000) "$ms ms" else "%.1f s".format(ms / 1000.0)
 
 private fun stageLabel(progress: GenerationProgress?): String = when (progress?.stage) {
     GenerationStage.PREPARING -> "Preparing latents"
