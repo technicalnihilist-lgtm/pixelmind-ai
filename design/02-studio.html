@@ -1,0 +1,150 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+* { margin:0; padding:0; box-sizing:border-box; -webkit-font-smoothing:antialiased; }
+body {
+  width: 420px; height: 900px; overflow:hidden;
+  font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  background:#07070C; color:#F2F3F9; position:relative;
+}
+.bloom { position:absolute; border-radius:50%; filter:blur(60px); }
+.b1 { width:520px; height:520px; left:-140px; top:-160px;
+      background:radial-gradient(circle, rgba(91,108,255,.42), rgba(91,108,255,0) 70%); }
+.b2 { width:460px; height:460px; right:-180px; top:280px;
+      background:radial-gradient(circle, rgba(34,211,238,.26), rgba(34,211,238,0) 70%); }
+.b3 { width:480px; height:480px; left:-60px; bottom:-200px;
+      background:radial-gradient(circle, rgba(244,114,182,.24), rgba(244,114,182,0) 70%); }
+.screen { position:relative; height:100%; padding:26px 20px 0; display:flex; flex-direction:column; }
+.statusbar { display:flex; justify-content:space-between; font-size:12px; font-weight:600;
+             color:rgba(242,243,249,.85); letter-spacing:.3px; padding:0 4px 14px; }
+.glass {
+  position:relative; border-radius:28px; padding:18px;
+  background:linear-gradient(180deg, rgba(255,255,255,.085), rgba(255,255,255,.035));
+  border:1px solid rgba(255,255,255,.13);
+  box-shadow:0 18px 40px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.10);
+  backdrop-filter: blur(18px);
+}
+.glass::before {
+  content:""; position:absolute; top:1px; left:26px; right:26px; height:1px;
+  background:linear-gradient(90deg, rgba(255,255,255,.5), rgba(255,255,255,0));
+}
+.row { display:flex; align-items:center; justify-content:space-between; }
+.brand { display:flex; align-items:center; gap:11px; }
+.mark { width:34px; height:34px; border-radius:11px;
+        background:linear-gradient(135deg,#5B6CFF,#8B5CF6,#22D3EE);
+        display:flex; align-items:center; justify-content:center; font-size:16px; color:#fff; }
+.brandname { font-size:19px; font-weight:650; letter-spacing:-.2px; }
+.pill { display:inline-flex; align-items:center; gap:8px; padding:7px 12px; border-radius:100px;
+        background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.14);
+        font-size:11px; font-weight:600; letter-spacing:.5px; color:rgba(242,243,249,.9); }
+.dot { width:7px; height:7px; border-radius:50%; }
+.h1 { font-size:36px; line-height:1.1; font-weight:300; letter-spacing:-1.2px; margin-top:20px; }
+.sub { font-size:13.5px; color:rgba(167,170,190,.95); margin-top:10px; line-height:1.5; }
+.well { border-radius:18px; padding:14px 16px; min-height:104px;
+        background:linear-gradient(180deg, rgba(0,0,0,.30), rgba(0,0,0,.18));
+        border:1px solid rgba(255,255,255,.10); font-size:15px; line-height:1.5; color:#F2F3F9; }
+.well.dim { color:rgba(167,170,190,.75); min-height:64px; font-size:13.5px; }
+.well.small { min-height:52px; font-size:13.5px; color:rgba(167,170,190,.75); }
+.chips { display:flex; gap:8px; overflow:hidden; margin-top:14px; }
+.chip { padding:9px 15px; border-radius:100px; font-size:13px; font-weight:600; white-space:nowrap;
+        background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.04));
+        border:1px solid rgba(255,255,255,.12); color:rgba(167,170,190,1); }
+.chip.on { background:linear-gradient(135deg, rgba(91,108,255,.9), rgba(139,92,246,.85));
+           border-color:rgba(255,255,255,.32); color:#fff; }
+.cta { margin-top:16px; height:56px; border-radius:18px; display:flex; align-items:center;
+       justify-content:center; gap:10px; font-size:15px; font-weight:650; color:#fff;
+       background:linear-gradient(90deg, rgba(91,108,255,.95), rgba(139,92,246,.95), rgba(34,211,238,.9));
+       border:1px solid rgba(255,255,255,.24); box-shadow:0 10px 30px rgba(91,108,255,.35); }
+.eyebrow { font-size:11px; font-weight:600; letter-spacing:1.6px; text-transform:uppercase;
+           color:rgba(167,170,190,.95); }
+.section { display:flex; align-items:center; justify-content:space-between; margin:20px 0 10px; }
+.section h3 { font-size:19px; font-weight:650; letter-spacing:-.2px; }
+.link { font-size:13px; font-weight:600; color:#22D3EE; }
+.recent { display:flex; gap:12px; }
+.tile { width:118px; }
+.thumb { width:118px; height:118px; border-radius:22px; }
+.cap { font-size:13px; color:rgba(167,170,190,.95); margin-top:8px;
+       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.stat { display:flex; justify-content:space-between; padding:7px 0; font-size:13.5px; }
+.stat .k { color:rgba(167,170,190,.95); }
+.stat .v { font-weight:600; }
+.divider { height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,.14), transparent);
+           margin:10px 0; }
+.nav { position:absolute; left:18px; right:18px; bottom:22px; border-radius:28px; padding:8px;
+       display:flex; justify-content:space-around; align-items:center;
+       background:linear-gradient(180deg, rgba(255,255,255,.10), rgba(255,255,255,.04));
+       border:1px solid rgba(255,255,255,.14); backdrop-filter: blur(20px);
+       box-shadow:0 20px 50px rgba(0,0,0,.55); }
+.navitem { display:flex; flex-direction:column; align-items:center; gap:4px; font-size:10.5px;
+           font-weight:600; color:rgba(167,170,190,.85); }
+.navicon { width:44px; height:30px; border-radius:12px; display:flex; align-items:center;
+           justify-content:center; font-size:14px; }
+.navitem.on { color:#F2F3F9; }
+.navitem.on .navicon { background:linear-gradient(135deg, rgba(91,108,255,.9), rgba(139,92,246,.8));
+                       color:#fff; }
+.warn { display:flex; align-items:center; gap:10px; font-size:15px; font-weight:600; }
+.body { font-size:13.5px; line-height:1.5; color:rgba(167,170,190,.95); margin-top:8px; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.gtile { position:relative; }
+.gtile .thumb { width:100%; height:170px; border-radius:22px; }
+.ring { width:108px; height:108px; border-radius:50%; display:flex; align-items:center;
+        justify-content:center; font-size:26px; font-weight:650;
+        background:conic-gradient(#5B6CFF 0deg, #8B5CF6 130deg, #22D3EE 230deg,
+                                  rgba(255,255,255,.10) 230deg 360deg);
+        position:relative; }
+.ring::after { content:""; position:absolute; inset:9px; border-radius:50%; background:#0B0C14; }
+.ring span { position:relative; z-index:1; }
+.seg { display:flex; gap:8px; }
+.seg .chip { flex:1; text-align:center; padding:9px 0; }
+/* home is the densest screen; these scoped rules keep it clear of the nav bar */
+.home .h1 { font-size:33px; margin-top:14px; }
+.home .sub { margin-top:8px; }
+.home .well { min-height:84px; }
+.home .section { margin:14px 0 8px; }
+.home .thumb { width:104px; height:104px; }
+.home .tile { width:104px; }
+.home .glass { padding:15px; }
+.home .cta { margin-top:14px; height:52px; }
+.home .chips { margin-top:12px; }
+</style></head>
+            <body>
+              <div class="bloom b1"></div><div class="bloom b2"></div><div class="bloom b3"></div>
+
+<div class="screen">
+  <div class="statusbar"><span>9:41</span><span>◐ ⌁ 87%</span></div>
+  <div class="h1" style="font-size:26px;font-weight:650;letter-spacing:-.6px;margin-top:0">Studio</div>
+  <div class="sub" style="margin-top:4px">Full control over the local pipeline.</div>
+
+  <div class="glass" style="margin-top:18px; padding:16px">
+    <div class="eyebrow">Prompt</div>
+    <div class="well" style="margin-top:10px">A brass astrolabe resting on mossy granite, morning light, macro detail, 85mm…</div>
+    <div class="eyebrow" style="margin-top:16px">Negative prompt</div>
+    <div class="well dim" style="margin-top:10px">blurry, extra fingers, watermark, text</div>
+  </div>
+
+  <div class="glass" style="margin-top:16px; padding:16px">
+    <div class="eyebrow">Aspect ratio</div>
+    <div class="chips" style="margin-top:12px">
+      <div class="chip on">1:1</div><div class="chip">4:5</div><div class="chip">9:16</div>
+      <div class="chip">16:9</div><div class="chip">3:2</div>
+    </div>
+    <div class="eyebrow" style="margin-top:16px">Speed / quality</div>
+    <div class="seg" style="margin-top:12px">
+      <div class="chip">Fast</div><div class="chip on">Balanced</div><div class="chip">Quality</div>
+    </div>
+    <div class="stat" style="margin-top:12px"><span class="k">6 steps · guidance 1.4</span>
+      <span class="k">Seed random</span></div>
+  </div>
+
+  <div class="glass" style="margin-top:16px">
+    <div class="row">
+      <div class="ring"><span>62%</span></div>
+      <div style="flex:1; margin-left:20px">
+        <div style="font-size:15px;font-weight:600">Diffusing</div>
+        <div class="stat" style="padding:4px 0"><span class="k">Step 4 of 6 · 21s</span></div>
+        <div style="font-size:11px;font-weight:600;color:#34D399;letter-spacing:.4px">RUNNING LOCALLY · NO NETWORK</div>
+      </div>
+    </div>
+    <div class="chip" style="margin-top:16px;text-align:center;display:block">✕&nbsp; Cancel</div>
+  </div>
+  <div class="nav"><div class="navitem"><div class="navicon">◈</div>Home</div><div class="navitem on"><div class="navicon">▷</div>Studio</div><div class="navitem"><div class="navicon">♡</div>Gallery</div><div class="navitem"><div class="navicon">⚙</div>Settings</div></div>
+</div>
+            </body></html>
