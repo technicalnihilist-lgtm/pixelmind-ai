@@ -170,7 +170,8 @@ class OnnxDiffusionEngine(
                     ?: "The local engine is not ready (${currentStatus.javaClass.simpleName})."
             )
         }
-        val fitted = memoryGuard.fitToDevice(request)
+        val weightsMb = (manifest?.totalBytes ?: 0L) / 1_048_576.0
+        val fitted = memoryGuard.fitToDevice(request, weightsMb)
             ?: return@withContext GenerationResult.Failed(
                 "This device does not have enough free memory to run the model safely."
             )

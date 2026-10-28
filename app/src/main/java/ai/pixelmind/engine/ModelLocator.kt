@@ -62,9 +62,11 @@ class ModelLocator(private val context: Context) {
             val manifest = ModelManifest.parse(manifestBytes.decodeToString())
             manifest.components.forEach { component ->
                 val target = File(modelDir, component.file)
-                if (target.exists() && target.length() == component.bytes) return@forEach
+                if (target.exists() && component.bytes > 0 && target.length() == component.bytes) {
+                    return@forEach
+                }
                 context.assets.open("models/${component.file}").use { input ->
-                    target.outputStream().use { output -> input.copyTo(output, DEFAULT_BUFFER_SIZE * 8) }
+                    writeModelFile(modelDir, component.file, input)
                 }
                 Log.i(TAG, "Provisioned ${component.file} (${component.bytes} bytes)")
             }
@@ -72,7 +74,7 @@ class ModelLocator(private val context: Context) {
             null
         } catch (t: Throwable) {
             Log.e(TAG, "Provisioning failed", t)
-            "Could not provision weights: ${t.message}"
+            "Could not prepare model files: ${t.message ?: t.javaClass.simpleName}"
         }
     }
 
@@ -97,4 +99,27 @@ class ModelLocator(private val context: Context) {
     private companion object {
         const val TAG = "ModelLocator"
     }
+}
+
+/**
+ * Copies one asset into the model directory.
+ *
+ * Manifest entries are relative paths ("clip/vocab.json"), so the containing directory has to be
+ * created before the stream is opened — omitting that is what made provisioning fail with ENOENT
+ * on a real device. The write goes through a ".part" file and is renamed into place, so an
+ * interrupted copy can never leave a truncated graph that later fails its checksum.
+ */
+internal fun writeModelFile(modelDir: File, relativePath: String, input: java.io.InputStream): File {
+    val target = File(modelDir, relativePath)
+    target.parentFile?.mkdirs()
+    val staging = File(target.parentFile, "${target.name}.part")
+    staging.outputStream().use { output -> input.copyTo(output, DEFAULT_BUFFER_SIZE * 8) }
+    if (target.exists() && !target.delete()) {
+        throw IllegalStateException("could not replace $relativePath")
+    }
+    if (!staging.renameTo(target)) {
+        staging.copyTo(target, overwrite = true)
+        staging.delete()
+    }
+    return target
 }

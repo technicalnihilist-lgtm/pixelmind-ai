@@ -184,8 +184,8 @@ fun HomeScreen(
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "PixelMind will not substitute stock images. Run tools/export_model.py and rebuild " +
-                            "to bundle the weights — see docs/MODEL.md.",
+                        "PixelMind will not substitute stock images. Confirm this build contains " +
+                            "app/src/main/assets/models — see docs/GETTING_IT_RUNNING.md.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
