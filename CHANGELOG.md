@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.1.3 — generation no longer stalls
+
+Reported from a device: progress froze at 5% for over a minute. 5% is the text-encoding stage, so
+the stall was before the diffusion loop even started.
+
+* **XNNPACK is now the first delegate, not NNAPI.** NNAPI recompiles its model for every new input
+  shape and pays a per-node dispatch cost; on a graph containing Gather, ReduceMean and Resize
+  that turned a sub-second pass into minutes. NNAPI remains as a fallback.
+* **Warm-up at load time.** Each graph runs once with tiny inputs right after session creation, so
+  first-use compilation is charged to "Loading engine" instead of to the user's first Generate.
+* **Per-stage timing in logcat** (`OnnxDiffusionEngine`): text encoding, every diffusion step, and
+  VAE decode now log their durations, so a slow device can be diagnosed from the log alone.
+
+
+## 1.1.2 — provisioning fix
+
+Fixes the failure seen on a real device:
+
+    Could not provision weights: /data/user/0/ai.pixelmind/files/models/clip/vocab.json:
+    open failed: ENOENT (No such file or directory)
+
+* `ModelLocator` now creates the containing directory before writing each asset. Manifest entries
+  are relative paths (`clip/vocab.json`) and the `clip/` directory was never created, so the copy
+  aborted before the manifest was written and every launch retried the same failure.
+* Writes go through a `.part` file and are renamed into place, so an interrupted copy cannot leave
+  a truncated graph behind.
+* `MemoryGuard` no longer budgets against `ActivityManager.memoryClass` — that is the Java heap
+  cap, and ONNX Runtime allocates natively, outside it. The budget now comes from the device's
+  actual free RAM.
+* `MemoryGuard` no longer assumes 640 MB of weights. The real figure is passed in from the model
+  manifest, so the 8 MB verification model is not treated like a 600 MB UNet.
+* Regression tests for nested-path provisioning (`ModelProvisioningTest`): 16 unit tests, all pass.
+
+
 ## 1.1.1 — model survey
 
 * `docs/MODEL_OPTIONS.md`: every pre-exported ONNX text-to-image model that fits this app's tensor

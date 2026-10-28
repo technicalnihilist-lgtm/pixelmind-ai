@@ -99,11 +99,15 @@ class OnnxDiffusionEngine(
         // Try the best delegate first, then fall back. A driver that accepts the session options
         // can still fail while building the graph (unsupported ops are common with NNAPI), so the
         // decision has to be made on session creation, not on addNnapi() returning without error.
+        // XNNPACK first, on purpose. NNAPI looks attractive on paper, but its delegate recompiles
+        // for every new input shape and pays a per-node dispatch cost — on a graph with Gather,
+        // ReduceMean and Resize nodes that turned a sub-second pass into minutes. XNNPACK runs
+        // the graph in-process with optimised CPU kernels and no shape recompilation.
         val attempts: List<Pair<String, (OrtSession.SessionOptions) -> Unit>> = listOf(
-            "NNAPI" to { opts: OrtSession.SessionOptions -> opts.addNnapi() },
             "XNNPACK" to { opts: OrtSession.SessionOptions ->
                 opts.addXnnpack(mapOf("intra_op_num_threads" to min(4, cores).toString()))
             },
+            "NNAPI" to { opts: OrtSession.SessionOptions -> opts.addNnapi() },
             "CPU" to { _: OrtSession.SessionOptions -> }
         )
 
@@ -147,6 +151,8 @@ class OnnxDiffusionEngine(
             maxLength = m.tokenizer.maxLength
         )
 
+        warmUp(runtimeEnv, m)
+
         modelInfo = ModelInfo(
             name = m.name,
             version = m.version,
@@ -170,7 +176,8 @@ class OnnxDiffusionEngine(
                     ?: "The local engine is not ready (${currentStatus.javaClass.simpleName})."
             )
         }
-        val fitted = memoryGuard.fitToDevice(request)
+        val weightsMb = (manifest?.totalBytes ?: 0L) / 1_048_576.0
+        val fitted = memoryGuard.fitToDevice(request, weightsMb)
             ?: return@withContext GenerationResult.Failed(
                 "This device does not have enough free memory to run the model safely."
             )
@@ -194,10 +201,13 @@ class OnnxDiffusionEngine(
 
                 // ---- 1. Text conditioning -------------------------------------------------
                 onProgress(GenerationProgress(GenerationStage.ENCODING_TEXT, 0, fitted.steps, elapsed(started)))
+                val textStarted = SystemClock.elapsedRealtime()
                 val condEmbedding = runTextEncoder(envLocal, enc, m, tok, fitted.conditionalText())
                 val uncondEmbedding = if (fitted.guidance > 1.05f) {
                     runTextEncoder(envLocal, enc, m, tok, fitted.negativePrompt.trim())
                 } else null
+
+                Log.i(TAG, "text encoding took ${SystemClock.elapsedRealtime() - textStarted} ms")
 
                 // ---- 2. Diffusion loop ----------------------------------------------------
                 val timesteps = scheduler.timesteps(fitted.steps)
@@ -225,12 +235,15 @@ class OnnxDiffusionEngine(
                     }
                     native.step(latent!!, eps, t, prev, scheduler)
                     stepIndex += 1
+                    Log.i(TAG, "step $stepIndex/${timesteps.size} done at ${elapsed(started)} ms")
                     onProgress(GenerationProgress(GenerationStage.DIFFUSING, stepIndex, fitted.steps, elapsed(started)))
                 }
 
                 // ---- 3. Decode --------------------------------------------------------------
                 onProgress(GenerationProgress(GenerationStage.DECODING, fitted.steps, fitted.steps, elapsed(started)))
+                val decodeStarted = SystemClock.elapsedRealtime()
                 val bitmap = decodeLatents(envLocal, vae, m, latent!!, fitted.width, fitted.height)
+                Log.i(TAG, "vae decode took ${SystemClock.elapsedRealtime() - decodeStarted} ms")
                 latent = null
 
                 // ---- 4. Persist -------------------------------------------------------------
@@ -258,6 +271,54 @@ class OnnxDiffusionEngine(
                 // Force the collectors to hand memory back before the next request arrives.
                 System.gc()
             }
+        }
+    }
+
+    /**
+     * Runs each graph once with tiny inputs. Delegates compile lazily on first execution, so
+     * without this the first Generate of the session absorbs that cost and looks like a hang.
+     * Failures here are logged, not fatal: a device that cannot run the warm-up will report the
+     * real error during generation.
+     */
+    private fun warmUp(env: OrtEnvironment, m: ModelManifest) {
+        val started = SystemClock.elapsedRealtime()
+        val seq = m.tokenizer.maxLength
+        val side = 8L
+        val latentSize = (m.latentChannels * side * side).toInt()
+        try {
+            val ids = LongArray(seq) { 49406L }
+            OnnxTensor.createTensor(env, LongBuffer.wrap(ids), longArrayOf(1, seq.toLong())).use { tensor ->
+                textEncoder?.run(mapOf(m.textEncoder.inputNames[0] to tensor))?.use { result ->
+                    result.get(m.textEncoder.outputName).orElse(null)
+                }
+            }
+            val embedding = FloatArray(seq * 768)
+            val latent = FloatArray(latentSize)
+            OnnxTensor.createTensor(env, FloatBuffer.wrap(embedding), longArrayOf(1, seq.toLong(), 768)).use { emb ->
+                OnnxTensor.createTensor(
+                    env, FloatBuffer.wrap(latent), longArrayOf(1, m.latentChannels.toLong(), side, side)
+                ).use { sample ->
+                    OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(500L)), longArrayOf(1)).use { step ->
+                        unet?.run(
+                            mapOf(
+                                m.unet.inputNames[0] to sample,
+                                m.unet.inputNames[1] to step,
+                                m.unet.inputNames[2] to emb
+                            )
+                        )?.use { result -> result.get(m.unet.outputName).orElse(null) }
+                    }
+                }
+            }
+            OnnxTensor.createTensor(
+                env, FloatBuffer.wrap(latent), longArrayOf(1, m.latentChannels.toLong(), side, side)
+            ).use { latentTensor ->
+                vaeDecoder?.run(mapOf(m.vaeDecoder.inputNames[0] to latentTensor))?.use { result ->
+                    result.get(m.vaeDecoder.outputName).orElse(null)
+                }
+            }
+            Log.i(TAG, "warm-up finished in ${SystemClock.elapsedRealtime() - started} ms ($accelerator)")
+        } catch (t: Throwable) {
+            Log.w(TAG, "warm-up failed; generation will still be attempted", t)
         }
     }
 
