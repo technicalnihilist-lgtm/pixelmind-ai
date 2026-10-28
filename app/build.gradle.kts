@@ -12,8 +12,8 @@ android {
         applicationId = "ai.pixelmind"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.1.4"
+        versionCode = 5
+        versionName = "1.1.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -92,6 +92,9 @@ dependencies {
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.18.0")
 
     testImplementation("junit:junit:4.13.2")
+    // Android's org.json is a stub on the JVM test classpath; the real implementation is needed
+    // for tests that build or parse a model manifest.
+    testImplementation("org.json:json:20240303")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

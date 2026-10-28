@@ -20,7 +20,11 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.unit.dp
 import ai.pixelmind.BuildConfig
 import ai.pixelmind.engine.EngineStatus
+import ai.pixelmind.ui.ImportUiState
 import ai.pixelmind.ui.PixelMindViewModel
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import ai.pixelmind.ui.components.GlassButton
 import ai.pixelmind.ui.theme.GlassCard
 import ai.pixelmind.ui.components.GlassDivider
 import ai.pixelmind.ui.components.SelectablePill
@@ -37,6 +41,16 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
     val modelInfo by viewModel.modelInfo.collectAsState()
     val hardware by viewModel.hardware.collectAsState()
     val storage by viewModel.storageBytes.collectAsState()
+    val importState by viewModel.importState.collectAsState()
+
+    // Storage Access Framework: the user grants access to individual documents, so the app still
+    // declares no permissions at all.
+    val zipPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) viewModel.importModelZip(uri) }
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> if (uris.isNotEmpty()) viewModel.importModelFiles(uris) }
     val modelBytes by viewModel.modelBytes.collectAsState()
 
     Column(
@@ -84,6 +98,74 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
             Text(
                 "The model ships inside the installation as an install-time asset pack. Nothing is " +
                     "downloaded at launch or on first use.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // ---- import from storage -------------------------------------------------------------
+        GlassCard(isDark = isDark) {
+            Eyebrow("Import from storage")
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Load weights you already have on this device. A .zip is easiest: it can contain " +
+                    "unet.onnx, text_encoder.onnx, vae_decoder.onnx and a clip/ folder with " +
+                    "vocab.json and merges.txt. A model_manifest.json is optional — one is written " +
+                    "for you if the files are named clearly.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(14.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                GlassButton(
+                    text = "Pick .zip",
+                    onClick = {
+                        zipPicker.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
+                    },
+                    isDark = isDark,
+                    modifier = Modifier.weight(1f)
+                )
+                GlassButton(
+                    text = "Pick files",
+                    onClick = { filePicker.launch(arrayOf("*/*")) },
+                    isDark = isDark,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            GlassButton(
+                text = "Restore bundled model",
+                onClick = viewModel::restoreBundledModel,
+                isDark = isDark,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            val state = importState
+            if (state !is ImportUiState.Idle) {
+                Spacer(Modifier.height(12.dp))
+                GlassDivider(isDark = isDark)
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    when (state) {
+                        is ImportUiState.Working -> state.message
+                        is ImportUiState.Done -> state.message
+                        is ImportUiState.Error -> state.message
+                        ImportUiState.Idle -> ""
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = when (state) {
+                        is ImportUiState.Error -> Palette.Danger
+                        is ImportUiState.Done -> Palette.Mint
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "An imported model is only kept if it loads. If it does not, the previous model is " +
+                    "restored automatically.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

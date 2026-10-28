@@ -111,6 +111,18 @@ class GenerationManager(
         }
     }
 
+    /**
+     * Drops the loaded model and builds it again — used after importing weights, and after a
+     * failed import when the previous model has to come back.
+     */
+    suspend fun reloadEngine(): EngineStatus {
+        if (activeJob != null) return _engineStatus.value
+        engine.release()
+        _modelInfo.value = null
+        _engineStatus.value = EngineStatus.Uninitialised
+        return ensureReady()
+    }
+
     fun releaseEngine() {
         activeTask?.cancel()
         engine.release()

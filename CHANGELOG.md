@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.5 — import a model from device storage
+
+* **Settings → Import from storage.** Pick a `.zip` or individual files with the system file
+  picker and use them immediately. The app still declares **no permissions**: the Storage Access
+  Framework grants access to one document at a time.
+* A `model_manifest.json` is optional. If the archive has `unet`, `text_encoder` and `vae_decoder`
+  graphs plus CLIP `vocab.json`/`merges.txt`, a manifest is written for you.
+* Import is transactional: files are staged, validated, then swapped in. **If the imported model
+  fails to load, the previous model is restored automatically** — the app never ends up holding
+  weights it cannot run.
+* Zip entries are sanitised against path traversal (`../`, absolute paths, drive letters) and the
+  archive is capped at 4 GB.
+* "Restore bundled model" removes the import and re-provisions the shipped one.
+
+Also restored two files that an earlier push had reverted: `MemoryGuard` (device-RAM budget) and
+`ModelLocator` (nested-directory provisioning). Both fixes are in the shipped 1.1.2+ APKs but had
+drifted on `main`, which would have broken a fresh clone.
+
+
 ## 1.1.4 — timings on screen, clearer model versioning
 
 * **Generation timing is now shown in the app.** Studio reports where the wall clock went —

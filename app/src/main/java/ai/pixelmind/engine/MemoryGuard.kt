@@ -6,45 +6,75 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Decides what the device can safely attempt *before* inference starts, so we never
- * discover an out-of-memory condition halfway through a diffusion loop.
+ * Decides what the device can safely attempt *before* inference starts, so we never discover an
+ * out-of-memory condition halfway through a diffusion loop.
  *
- * The estimate is deliberately conservative: UNet activations dominate, and int8 weights
- * still expand into float32 activations at runtime.
+ * Two things this deliberately does not do:
+ *
+ *  * it does not use [ActivityManager.getMemoryClass] as the budget. That number is the *Java
+ *    heap* cap, and ONNX Runtime allocates its tensors natively, outside it. A phone with a
+ *    512 MB heap class can still run a 1.2 GB model if it has the RAM. The budget comes from
+ *    the device's actual free memory instead.
+ *  * it does not assume a fixed weight size. An 8 MB verification model and a 1.2 GB SD export
+ *    need very different working sets, so the caller passes the real figure from the manifest.
  */
 class MemoryGuard(context: Context) {
 
     private val activityManager =
         context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
-    /** Total memory the process may reasonably use, in MB. */
+    private val info = ActivityManager.MemoryInfo()
+
+    /** Java heap class, shown in Settings for information only — not used as a budget. */
     val memoryClassMb: Int = activityManager.memoryClass
 
     val isLowRamDevice: Boolean = activityManager.isLowRamDevice
 
-    fun estimatePeakMb(width: Int, height: Int, steps: Int): Int {
-        val pixels = width.toLong() * height.toLong()
-        // Weights resident in RAM (int8 UNet ~ 470 MB, text encoder ~ 60 MB, VAE ~ 100 MB).
-        val weights = 640
-        // Latents + attention workspace + VAE decode buffer, scaled by output size.
-        val activations = (pixels / 262_144.0) * 180.0
-        val decode = (pixels / 262_144.0) * 120.0
-        val overhead = 60 + steps * 2
-        return (weights + activations + decode + overhead).toInt()
+    val totalRamMb: Int
+        get() = (readInfo().totalMem / MB).toInt()
+
+    val availableRamMb: Int
+        get() = (readInfo().availMem / MB).toInt()
+
+    private fun readInfo(): ActivityManager.MemoryInfo {
+        activityManager.getMemoryInfo(info)
+        return info
     }
 
     /**
-     * Returns the request adjusted down until it fits. Returns null when even the floor
-     * configuration cannot run on this device.
+     * Estimated peak resident memory for one generation, in MB.
+     *
+     * [weightsMb] is the model's on-disk size, which for these graphs is also roughly what it
+     * costs in RAM once loaded. The workspace terms scale with both output resolution and model
+     * complexity: a toy graph has tiny activations, a 600 MB UNet has very large ones.
      */
-    fun fitToDevice(request: GenerationRequest): GenerationRequest? {
-        val budgetMb = max(384, (memoryClassMb * 0.75).toInt())
+    fun estimatePeakMb(width: Int, height: Int, steps: Int, weightsMb: Double): Int {
+        val megapixels = (width.toLong() * height.toLong()) / 262_144.0 // 512x512 == 1.0
+        val complexity = (weightsMb / 640.0).coerceIn(0.15, 1.0)
+        val activations = megapixels * 180.0 * complexity
+        val decode = megapixels * 120.0 * complexity
+        val overhead = 60.0 + steps * 2
+        return (weightsMb + activations + decode + overhead).toInt()
+    }
+
+    /**
+     * Returns the request adjusted down until it fits, or null when even the floor configuration
+     * cannot run here.
+     */
+    fun fitToDevice(request: GenerationRequest, weightsMb: Double): GenerationRequest? {
+        val free = availableRamMb
+        val total = totalRamMb
+        // Leave the OS and the rest of the process room to breathe: never plan to use more than
+        // 60% of what is free, and never more than half of physical RAM.
+        val budgetMb = min((free * 0.60).toInt(), (total * 0.50).toInt())
+            .coerceAtLeast(MIN_BUDGET_MB)
+
         var width = request.width
         var height = request.height
         var steps = request.steps
 
-        repeat(6) {
-            val peak = estimatePeakMb(width, height, steps)
+        repeat(8) {
+            val peak = estimatePeakMb(width, height, steps, weightsMb)
             if (peak <= budgetMb) {
                 return request.copy(width = width, height = height, steps = steps)
             }
@@ -57,24 +87,31 @@ class MemoryGuard(context: Context) {
                 else -> return null
             }
         }
-        val peak = estimatePeakMb(width, height, steps)
-        return if (peak <= budgetMb) request.copy(width = width, height = height, steps = steps) else null
+        val peak = estimatePeakMb(width, height, steps, weightsMb)
+        return if (peak <= budgetMb) {
+            request.copy(width = width, height = height, steps = steps)
+        } else {
+            null
+        }
     }
 
     fun describe(): String {
         val tier = when {
-            memoryClassMb >= 512 -> "High"
-            memoryClassMb >= 256 -> "Standard"
+            totalRamMb >= 8_000 -> "High"
+            totalRamMb >= 4_000 -> "Standard"
             else -> "Limited"
         }
-        return "$tier · ${memoryClassMb} MB heap · ${if (isLowRamDevice) "low-RAM device" else "full-RAM device"}"
+        return "$tier · ${totalRamMb} MB RAM · ${availableRamMb} MB free · " +
+            "${if (isLowRamDevice) "low-RAM device" else "full-RAM device"}"
     }
 
     private fun snapTo8(value: Int): Int = (value / 8) * 8
 
     companion object {
+        private const val MB = 1_048_576.0
         const val MIN_EDGE = 256
         const val MIN_STEPS = 4
+        private const val MIN_BUDGET_MB = 256
         fun clampResolution(value: Int): Int = min(768, max(MIN_EDGE, (value / 8) * 8))
     }
 }

@@ -6,6 +6,7 @@ import ai.pixelmind.data.PixelMindRepository
 import ai.pixelmind.data.SettingsStore
 import ai.pixelmind.engine.LocalAIEngine
 import ai.pixelmind.engine.MemoryGuard
+import ai.pixelmind.engine.ModelImporter
 import ai.pixelmind.engine.ModelLocator
 import ai.pixelmind.engine.OnnxDiffusionEngine
 import ai.pixelmind.manager.GenerationManager
@@ -31,6 +32,7 @@ class AppContainer(context: Context) {
     val repository = PixelMindRepository(db, imageStore)
     val modelLocator = ModelLocator(appContext)
     val settingsStore = SettingsStore(appContext)
+    val modelImporter = ModelImporter(appContext)
 
     val engine: LocalAIEngine = OnnxDiffusionEngine(
         context = appContext,

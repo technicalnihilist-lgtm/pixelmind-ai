@@ -8,6 +8,7 @@ import ai.pixelmind.engine.EngineStatus
 import ai.pixelmind.engine.GenerationProgress
 import ai.pixelmind.engine.GenerationRequest
 import ai.pixelmind.engine.GenerationResult
+import ai.pixelmind.engine.ModelImporter
 import ai.pixelmind.engine.ModelInfo
 import ai.pixelmind.engine.QualityTier
 import ai.pixelmind.engine.RunTimings
@@ -48,6 +49,14 @@ data class HardwareUiState(
     val device: String = ""
 )
 
+/** Progress and outcome of a model import, surfaced in Settings. */
+sealed interface ImportUiState {
+    data object Idle : ImportUiState
+    data class Working(val message: String) : ImportUiState
+    data class Done(val message: String) : ImportUiState
+    data class Error(val message: String) : ImportUiState
+}
+
 class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
 
     private val manager: GenerationManager = container.generationManager
@@ -67,6 +76,9 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
 
     private val _lastImage = MutableStateFlow<String?>(null)
     val lastImage: StateFlow<String?> = _lastImage.asStateFlow()
+
+    private val _importState = MutableStateFlow<ImportUiState>(ImportUiState.Idle)
+    val importState: StateFlow<ImportUiState> = _importState.asStateFlow()
 
     private val _lastTimings = MutableStateFlow<RunTimings?>(null)
     val lastTimings: StateFlow<RunTimings?> = _lastTimings.asStateFlow()
@@ -191,6 +203,79 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
 
     fun shareImage(record: GenerationRecord, context: android.content.Context) {
         ai.pixelmind.util.ShareUtil.shareImage(context, File(record.filePath))
+    }
+
+    // ---- model import ---------------------------------------------------------------------
+
+    fun importModelZip(uri: android.net.Uri) {
+        runImport("Unpacking archive…") { container.modelImporter.importZip(uri) }
+    }
+
+    fun importModelFiles(uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
+        runImport("Reading ${uris.size} file(s)…") { container.modelImporter.importFiles(uris) }
+    }
+
+    fun restoreBundledModel() {
+        viewModelScope.launch {
+            _importState.value = ImportUiState.Working("Removing the imported model…")
+            val result = container.modelImporter.restoreBundled()
+            if (result is ModelImporter.Result.Failed) {
+                _importState.value = ImportUiState.Error(result.reason)
+                return@launch
+            }
+            when (val status = manager.reloadEngine()) {
+                is EngineStatus.Ready -> {
+                    _importState.value = ImportUiState.Done("Bundled model restored.")
+                    refreshStorage()
+                }
+                else -> _importState.value = ImportUiState.Error(
+                    "Bundled model did not load: ${describe(status)}"
+                )
+            }
+        }
+    }
+
+    private fun runImport(initialMessage: String, action: suspend () -> ModelImporter.Result) {
+        viewModelScope.launch {
+            _importState.value = ImportUiState.Working(initialMessage)
+            val result = action()
+            if (result is ModelImporter.Result.Failed) {
+                _importState.value = ImportUiState.Error(result.reason)
+                return@launch
+            }
+            val imported = result as ModelImporter.Result.Imported
+            _importState.value = ImportUiState.Working("Loading ${imported.name}…")
+
+            // The only honest test of imported weights is whether they load. If they do not, put
+            // the previous model back rather than leaving the app unable to generate.
+            when (val status = manager.reloadEngine()) {
+                is EngineStatus.Ready -> {
+                    container.modelImporter.discardPrevious()
+                    _importState.value = ImportUiState.Done(
+                        "${imported.name} ${imported.version} loaded " +
+                            "(${imported.bytes / 1_048_576} MB, ${status.accelerator})."
+                    )
+                    refreshStorage()
+                }
+                else -> {
+                    val rolledBack = container.modelImporter.rollback()
+                    manager.reloadEngine()
+                    _importState.value = ImportUiState.Error(
+                        "That model did not load: ${describe(status)}" +
+                            if (rolledBack) " The previous model was restored." else ""
+                    )
+                }
+            }
+        }
+    }
+
+    private fun describe(status: EngineStatus): String = when (status) {
+        is EngineStatus.Failed -> status.detail
+        is EngineStatus.WeightsMissing -> status.detail
+        EngineStatus.Loading -> "still loading"
+        is EngineStatus.Ready -> "ready"
+        EngineStatus.Uninitialised -> "not initialised"
     }
 
     // ---- settings -------------------------------------------------------------------------
