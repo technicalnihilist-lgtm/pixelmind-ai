@@ -6,6 +6,11 @@ no server, no analytics, and no `INTERNET` permission in the manifest.
 Kotlin + Jetpack Compose UI, ONNX Runtime as the local inference layer, and a Liquid Glass
 design system.
 
+**Download the APK:** [pixelmind-ai-1.1.0-arm64.apk](https://github.com/technicalnihilist-lgtm/pixelmind-ai/releases/download/v1.1.0/pixelmind-ai-1.1.0-arm64.apk)
+· 29 MB · arm64-v8a · Android 8.0+ · SHA-256 `902907b542cd8d705817d6fe51d3e0ad4c969d354ae7d51936bc1b1a8191075c`
+
+Screens: [Home](design/01-home.png) · [Studio](design/02-studio.png) · [Gallery](design/03-gallery.png) · [Settings](design/04-settings.png) · [sample output](design/05-sample-output.png)
+
 ---
 
 ## Status — read this first
