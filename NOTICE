@@ -1,0 +1,7 @@
+pixelmind-ai - third-party notices
+
+The MIT License in the LICENSE file covers the application source code only.
+
+Model weights derived from Stable Diffusion 1.5 are licensed under the
+CreativeML OpenRAIL-M license and are not included in this repository; see
+docs/MODEL.md.
