@@ -91,7 +91,9 @@ class GenerationManager(
 
     fun retry(jobId: Long) {
         val job = _jobs.value.firstOrNull { it.id == jobId } ?: return
-        if (job.state == JobState.RUNNING) return
+        // A queued job is already in the work channel; enqueueing it twice ran the same request
+        // back to back once the first pass finished.
+        if (job.state == JobState.RUNNING || job.state == JobState.QUEUED) return
         _jobs.value = _jobs.value.map { if (it.id == jobId) it.copy(state = JobState.QUEUED, message = null) else it }
         work.trySend(jobId)
     }
@@ -125,30 +127,46 @@ class GenerationManager(
 
     fun releaseEngine() {
         activeTask?.cancel()
-        engine.release()
         _engineStatus.value = EngineStatus.Uninitialised
+        _modelInfo.value = null
+        // engine.release() takes the engine lock, which an in-flight generation holds until it
+        // reaches the next cancellation check — a whole diffusion step. The caller is
+        // ProcessLifecycleOwner.onStop(), i.e. the main thread, so the close has to happen off it.
+        scope.launch { engine.release() }
     }
 
     private suspend fun runJob(job: Job) {
         updateJob(job.id, JobState.RUNNING)
         activeJob = job
         _lastResult.value = null
-        activeTask = scope.launch {
-            val result = engine.generate(job.request) { p -> _progress.value = p }
-            _progress.value = null
-            when (result) {
-                is GenerationResult.Success -> {
-                    repository.record(job.request, result.image)
-                    updateJob(job.id, JobState.SUCCEEDED)
-                }
-                is GenerationResult.Failed -> updateJob(job.id, JobState.FAILED, result.reason)
-                GenerationResult.Cancelled -> updateJob(job.id, JobState.CANCELLED)
-            }
-            _lastResult.value = result
-            results.send(result)
+        val task = scope.launch { execute(job) }
+        activeTask = task
+        try {
+            task.join()
+        } finally {
+            // Cleared here, not inside the task: a task cancelled before its body ever starts
+            // never reaches a finally block of its own, and a leaked activeJob made
+            // reloadEngine() a silent no-op for the rest of the process lifetime.
+            activeTask = null
             activeJob = null
         }
-        activeTask?.join()
+    }
+
+    private suspend fun execute(job: Job) {
+        val result = engine.generate(job.request) { p -> _progress.value = p }
+        _progress.value = null
+        when (result) {
+            is GenerationResult.Success -> {
+                repository.record(job.request, result.image)
+                updateJob(job.id, JobState.SUCCEEDED)
+            }
+            is GenerationResult.Failed -> updateJob(job.id, JobState.FAILED, result.reason)
+            GenerationResult.Cancelled -> updateJob(job.id, JobState.CANCELLED)
+        }
+        _lastResult.value = result
+        // trySend, not send: with no collector attached (app in the background, screen not
+        // composed) a full buffer would suspend here and stall the whole queue forever.
+        results.trySend(result)
     }
 
     private fun updateJob(id: Long, state: JobState, message: String? = null) {

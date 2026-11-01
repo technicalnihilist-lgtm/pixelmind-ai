@@ -30,14 +30,26 @@ object ExportUtil {
         }
         val resolver = context.contentResolver
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
-        return runCatching {
-            resolver.openOutputStream(uri)?.use { out ->
-                file.inputStream().use { input -> input.copyTo(out) }
-            } ?: return false
-            values.clear()
-            values.put(MediaStore.Images.Media.IS_PENDING, 0)
-            resolver.update(uri, values, null, null)
-            true
-        }.getOrDefault(false)
+        var published = false
+        try {
+            val out = resolver.openOutputStream(uri)
+            if (out == null) return false
+            out.use { stream ->
+                file.inputStream().use { input -> input.copyTo(stream) }
+            }
+            published = resolver.update(
+                uri,
+                ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) },
+                null,
+                null
+            ) > 0
+            return published
+        } catch (t: Throwable) {
+            return false
+        } finally {
+            // A failed copy used to leave an IS_PENDING=1 row behind: an invisible, empty entry in
+            // the user's Pictures collection that never cleaned itself up.
+            if (!published) runCatching { resolver.delete(uri, null, null) }
+        }
     }
 }

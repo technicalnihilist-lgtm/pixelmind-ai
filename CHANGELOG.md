@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.1.6 — stability pass: engine lifecycle, model repair, import integrity
+
+A maintenance release. No UI, feature, model-format or permission changes — the app still
+declares no platform permissions and cannot open a socket.
+
+**Engine lifecycle (crashes and stalls)**
+
+* **Loading the model is now serialised against releasing it.** A background transition that
+  arrived while the sessions were being built could leave one set of ONNX sessions open and
+  unreachable, with the status flipping to *Ready* afterwards over closed handles. The next
+  Generate then failed with a confusing message.
+* **Releasing the engine no longer runs on the main thread.** `engine.release()` waits for an
+  in-flight generation to reach its next cancellation check — a whole diffusion step — and the
+  caller is `onStop()`. A long step could therefore freeze the UI on the way to the background.
+* **A cancelled generation no longer wedges the queue.** The active job was only cleared inside
+  the job's own coroutine, so a task cancelled before it started left `activeJob` set for the rest
+  of the process lifetime — and `reloadEngine()` silently refuses to run while a job is active,
+  which made "Restore bundled model" and post-import reloads do nothing after a cancel.
+* **A full result buffer no longer stalls the queue.** Results went out through a suspending
+  `send()`; with no collector attached the 64-deep buffer could fill and block the worker forever.
+* `retry` no longer enqueues a job that is already queued, which ran the same request twice.
+
+**Model files (startup, I/O, recovery)**
+
+* **A damaged weight file is now repaired instead of being fatal.** A truncated or half-copied
+  component made `resolve()` report *Corrupt* on every launch until the user cleared app data,
+  even though the asset pack still held a good copy. The bundled set is now re-provisioned once
+  and re-verified. An *imported* model that fails its own checksums is left untouched — silently
+  swapping a user's weights for the bundled ones would be worse than saying the file is broken.
+* **Components are not re-hashed on every load.** Verifying a 1 GB weight set costs seconds and
+  used to happen on every engine load, including every return from the background (sessions are
+  released on stop). Digests are cached against (length, last-modified); any change forces a
+  re-read. The cache is invalidated whenever weights are provisioned or imported.
+* A failed `.part` copy no longer leaves the staging file behind in `filesDir`.
+
+**Model import**
+
+* **Checksums are verified before the swap, not after.** A truncated graph used to install, fail
+  to load, and roll back with a vaguer message. It is now rejected up front, naming the file.
+* **The 4 GB cap is enforced while copying.** The old check ran after an entry had been fully
+  written, so one oversized zip entry could fill the device before being refused.
+* Selecting individual files that share a name (`unet/model.onnx` and `text_encoder/model.onnx`
+  both flatten to `model.onnx`) now fails with a message that says to import a zip, instead of
+  silently keeping only the last one.
+
+**Memory and correctness**
+
+* A PNG that failed to encode no longer strands a full-resolution bitmap.
+* A VAE whose output does not match the 8× latent grid now reports that, instead of crashing with
+  an index-out-of-bounds deep inside the decode loop.
+* A failed export to Pictures no longer leaves an invisible `IS_PENDING` row in the gallery.
+* Two generations with the same seed in the same millisecond no longer overwrite one image file.
+* The UNet's VAE-scaled copy of the latent is a reused buffer rather than a fresh array per call.
+* The CLIP pre-tokeniser regex is compiled once instead of on every encode, and the BPE cache is
+  bounded and thread-safe.
+* `LcmScheduler.timesteps(0)` no longer divides by zero.
+
+**Tests** — 25 unit tests, up from 13. New coverage for zip entry sanitising (traversal, absolute
+paths, drive letters), component detection, generated-manifest round-trip and digests, schedule
+validity across every step count the app offers, and tokenizer truncation.
+
 ## 1.1.5 — import a model from device storage
 
 * **Settings → Import from storage.** Pick a `.zip` or individual files with the system file

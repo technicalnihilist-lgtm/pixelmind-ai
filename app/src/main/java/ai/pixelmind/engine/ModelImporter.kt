@@ -52,16 +52,27 @@ class ModelImporter(private val context: Context) {
     suspend fun importFiles(uris: List<Uri>): Result = withContext(Dispatchers.IO) {
         try {
             freshStaging()
+            val seen = HashSet<String>()
             uris.forEach { uri ->
                 val name = displayName(uri) ?: return@withContext Result.Failed(
                     "Could not read a file name from the selection."
                 )
                 val safe = sanitiseEntryPath(name)
                     ?: return@withContext Result.Failed("Unsafe file name: $name")
+                // Picking files one by one strips their folders, so two graphs that are both
+                // called model.onnx land on the same path and one silently overwrote the other.
+                if (!seen.add(safe)) {
+                    return@withContext Result.Failed(
+                        "Two selected files are both named $safe. Import a .zip instead so the " +
+                            "folder names are kept."
+                    )
+                }
                 val target = File(staging, safe)
                 target.parentFile?.mkdirs()
                 context.contentResolver.openInputStream(uri)?.use { input ->
-                    target.outputStream().use { output -> input.copyTo(output, BUFFER) }
+                    target.outputStream().use { output ->
+                        copyLimited(input, output, MAX_IMPORT_BYTES)
+                    }
                 } ?: return@withContext Result.Failed("Could not open $name.")
             }
             finishImport()
@@ -77,6 +88,7 @@ class ModelImporter(private val context: Context) {
         val removed = root.deleteRecursively()
         staging.deleteRecursively()
         previous.deleteRecursively()
+        invalidateVerification()
         if (removed) {
             Result.Imported("Bundled model", "—", 0L)
         } else {
@@ -129,12 +141,11 @@ class ModelImporter(private val context: Context) {
                     continue
                 }
                 target.parentFile?.mkdirs()
+                // The cap is enforced while copying, not after: a single zip entry can decompress
+                // to far more than the limit, and the old check only ran once the whole entry had
+                // already been written to the device.
                 target.outputStream().use { output ->
-                    val copied = zip.copyTo(output, BUFFER)
-                    total += copied
-                }
-                if (total > MAX_IMPORT_BYTES) {
-                    throw IllegalStateException("Archive is larger than 4 GB")
+                    total += copyLimited(zip, output, MAX_IMPORT_BYTES - total)
                 }
                 zip.closeEntry()
             }
@@ -159,15 +170,25 @@ class ModelImporter(private val context: Context) {
                         ".onnx files, a clip/ folder with vocab.json and merges.txt, and " +
                         "model_manifest.json — or pick a .zip that has them."
                 )
-            val json = buildManifestJson(detected, files, staging)
+            val json = buildManifestJson(detected, staging)
                 ?: return Result.Failed("Could not describe the imported files.")
             ModelManifest.parse(json)
         }
 
-        // Every component the manifest names must exist, otherwise the engine will fail later.
+        // Every component the manifest names must exist and match its checksum, otherwise the
+        // engine would fail at load time and the rollback would throw the import away anyway.
         manifest.components.forEach { component ->
-            if (!File(staging, component.file).exists()) {
+            val staged = File(staging, component.file)
+            if (!staged.exists()) {
                 return Result.Failed("Missing ${component.file} inside the import.")
+            }
+            if (component.sha256.isNotBlank() &&
+                !sha256(staged).equals(component.sha256, ignoreCase = true)
+            ) {
+                return Result.Failed(
+                    "${component.file} does not match the checksum in its manifest — the file " +
+                        "is truncated or was modified after the manifest was written."
+                )
             }
         }
 
@@ -180,7 +201,27 @@ class ModelImporter(private val context: Context) {
             previous.renameTo(root)
             return Result.Failed("Could not install the imported model.")
         }
+        // Cached digests describe the model that was just moved aside.
+        invalidateVerification()
         return Result.Imported(manifest.name, manifest.version, manifest.totalBytes)
+    }
+
+    /** Copies at most [budget] bytes, so an oversized stream is refused instead of filling the disk. */
+    private fun copyLimited(input: InputStream, output: java.io.OutputStream, budget: Long): Long {
+        val buffer = ByteArray(BUFFER)
+        var written = 0L
+        while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) break
+            written += read
+            if (written > budget) throw IllegalStateException("Archive is larger than 4 GB")
+            output.write(buffer, 0, read)
+        }
+        return written
+    }
+
+    private fun invalidateVerification() {
+        runCatching { File(context.filesDir, ModelLocator.VERIFIED_FILE).delete() }
     }
 
     private fun displayName(uri: Uri): String? {
@@ -245,11 +286,7 @@ class ModelImporter(private val context: Context) {
         )
 
         /** Writes a manifest describing files that arrived without one. */
-        internal fun buildManifestJson(
-            detected: Detected,
-            files: List<File>,
-            root: File
-        ): String? {
+        internal fun buildManifestJson(detected: Detected, root: File): String? {
             fun component(relPath: String): JSONObject {
                 val file = File(root, relPath)
                 if (!file.exists()) return JSONObject()

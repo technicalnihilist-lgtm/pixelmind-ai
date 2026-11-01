@@ -21,7 +21,14 @@ class ImageStore(private val context: Context) {
     }
 
     fun save(bitmap: Bitmap, seed: Long): File {
-        val file = File(root, "pm_${System.currentTimeMillis()}_$seed.png")
+        // Two generations with the same seed inside the same millisecond used to resolve to the
+        // same name, so the second silently overwrote the first one's file.
+        val stamp = System.currentTimeMillis()
+        var file = File(root, "pm_${stamp}_$seed.png")
+        var attempt = 1
+        while (file.exists()) {
+            file = File(root, "pm_${stamp}_${seed}_${attempt++}.png")
+        }
         FileOutputStream(file).use { out ->
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
         }

@@ -43,7 +43,6 @@ data class StudioUiState(
 data class HardwareUiState(
     val memoryClassMb: Int = 0,
     val isLowRam: Boolean = false,
-    val accelerator: String = "CPU",
     val cores: Int = 0,
     val abis: String = "",
     val device: String = ""
@@ -292,7 +291,6 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
         _hardware.value = HardwareUiState(
             memoryClassMb = guard.memoryClassMb,
             isLowRam = guard.isLowRamDevice,
-            accelerator = (engineStatus.value as? EngineStatus.Ready)?.accelerator ?: "CPU",
             cores = Runtime.getRuntime().availableProcessors(),
             abis = android.os.Build.SUPPORTED_ABIS.joinToString(", "),
             device = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · API ${android.os.Build.VERSION.SDK_INT}"

@@ -52,6 +52,21 @@ class ClipTokenizerTest {
         assertTrue(tokens.any { it.startsWith(",") })
     }
 
+
+    @Test
+    fun `a prompt longer than the context window is truncated, not overflowed`() {
+        val ids = tokenizer().encode("hello hello hello hello hello hello hello hello")
+        assertEquals(8, ids.size)
+        assertEquals(0L, ids[0])
+        assertEquals(1L, ids[ids.size - 1])
+    }
+
+    @Test
+    fun `repeated encodes return identical ids`() {
+        val tokenizer = tokenizer()
+        assertTrue(tokenizer.encode("hello, world").contentEquals(tokenizer.encode("hello, world")))
+    }
+
     @Test
     fun `lowercasing is applied before tokenisation`() {
         val upper = tokenizer().tokenize("HELLO")

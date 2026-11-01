@@ -30,8 +30,10 @@ class LcmScheduler(
 
     /** Evenly spaced timesteps, descending, ending above zero — LCM's `linspace` spacing. */
     fun timesteps(steps: Int): IntArray {
-        val stepRatio = numTrainTimesteps / steps
-        return IntArray(steps) { i -> numTrainTimesteps - 1 - i * stepRatio }
+        // Clamped rather than trusted: a zero here used to divide by zero inside the schedule.
+        val count = steps.coerceAtLeast(1)
+        val stepRatio = numTrainTimesteps / count
+        return IntArray(count) { i -> numTrainTimesteps - 1 - i * stepRatio }
     }
 
     fun sigmaFor(timestep: Int): Double {
@@ -65,8 +67,6 @@ class LcmScheduler(
      * the result is written back into [latent].
      */
     fun step(latent: FloatArray, modelOutput: FloatArray, timestep: Int, prevTimestep: Int) {
-        val sigma = sigmaFor(timestep)
-        val sigmaPrev = if (prevTimestep < 0) 0.0 else sigmaFor(prevTimestep)
         val alphaPrev = if (prevTimestep < 0) 1.0 else alphasCumprod[prevTimestep]
 
         val cSkip = cSkip(timestep)

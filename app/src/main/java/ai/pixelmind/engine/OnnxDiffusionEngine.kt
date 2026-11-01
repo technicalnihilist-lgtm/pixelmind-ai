@@ -60,17 +60,23 @@ class OnnxDiffusionEngine(
     override fun modelInfo(): ModelInfo? = modelInfo
 
     override suspend fun initialize(): EngineStatus = withContext(Dispatchers.Default) {
-        if (currentStatus.isReady) return@withContext currentStatus
+        // Building sessions takes seconds and hundreds of megabytes, so it is serialised against
+        // release() and against a second concurrent initialise. Without that, a background
+        // transition arriving mid-load (release() runs while the sessions are being built) leaves
+        // one set of sessions open and unreachable, and the status flips back to Ready afterwards.
+        synchronized(lock) { initialiseLocked() }
+    }
+
+    private fun initialiseLocked(): EngineStatus {
+        if (currentStatus.isReady) return currentStatus
         currentStatus = EngineStatus.Loading
-        try {
+        return try {
             when (val resolution = locator.resolve()) {
                 is ModelLocator.Resolution.Missing -> {
                     currentStatus = EngineStatus.WeightsMissing(resolution.detail)
-                    return@withContext currentStatus
                 }
                 is ModelLocator.Resolution.Corrupt -> {
                     currentStatus = EngineStatus.Failed(resolution.detail)
-                    return@withContext currentStatus
                 }
                 is ModelLocator.Resolution.Available -> {
                     val located = resolution.located
@@ -80,9 +86,9 @@ class OnnxDiffusionEngine(
                         info = requireNotNull(modelInfo),
                         accelerator = accelerator
                     )
-                    currentStatus
                 }
             }
+            currentStatus
         } catch (t: Throwable) {
             Log.e(TAG, "Engine initialisation failed", t)
             releaseInternal()
@@ -171,10 +177,7 @@ class OnnxDiffusionEngine(
         onProgress: (GenerationProgress) -> Unit
     ): GenerationResult = withContext(Dispatchers.Default) {
         if (!currentStatus.isReady) {
-            return@withContext GenerationResult.Failed(
-                (currentStatus as? EngineStatus.WeightsMissing)?.detail
-                    ?: "The local engine is not ready (${currentStatus.javaClass.simpleName})."
-            )
+            return@withContext GenerationResult.Failed(notReadyReason(currentStatus))
         }
         val weightsMb = (manifest?.totalBytes ?: 0L) / 1_048_576.0
         val fitted = memoryGuard.fitToDevice(request, weightsMb)
@@ -186,9 +189,13 @@ class OnnxDiffusionEngine(
         }
 
         synchronized(lock) {
+            // Re-checked under the lock: release() may have closed the sessions between the check
+            // above and this point (the app going to background while a request is queued).
+            if (!currentStatus.isReady) {
+                return@withContext GenerationResult.Failed(notReadyReason(currentStatus))
+            }
             val started = SystemClock.elapsedRealtime()
             val seed = fitted.resolvedSeed()
-            var latent: FloatArray? = null
             try {
                 val m = requireNotNull(manifest)
                 val tok = requireNotNull(tokenizer)
@@ -216,11 +223,13 @@ class OnnxDiffusionEngine(
                 val latentW = fitted.width / 8
                 val latentSize = m.latentChannels * latentH * latentW
 
-                val noise = FloatArray(latentSize)
+                val latent = FloatArray(latentSize)
                 val rng = Random(seed)
                 val scale = scheduler.initialNoiseScale(timesteps[0]).toFloat()
-                for (i in noise.indices) noise[i] = (rng.nextGaussian().toFloat() * scale)
-                latent = noise
+                for (i in latent.indices) latent[i] = (rng.nextGaussian().toFloat() * scale)
+                // One scratch buffer for the VAE-scaled copy the UNet sees, reused by every step
+                // instead of a fresh array per UNet call (two calls per step, plus the uncond pass).
+                val scaled = FloatArray(latentSize)
 
                 var stepIndex = 0
                 while (stepIndex < timesteps.size) {
@@ -228,13 +237,13 @@ class OnnxDiffusionEngine(
                     val t = timesteps[stepIndex]
                     val prev = if (stepIndex + 1 < timesteps.size) timesteps[stepIndex + 1] else -1
 
-                    val eps = runUnet(envLocal, unetSession, m, latent!!, t, latentH, latentW, condEmbedding)
+                    val eps = runUnet(envLocal, unetSession, m, latent, scaled, t, latentH, latentW, condEmbedding)
                     if (uncondEmbedding != null) {
-                        val epsUncond = runUnet(envLocal, unetSession, m, latent!!, t, latentH, latentW, uncondEmbedding)
+                        val epsUncond = runUnet(envLocal, unetSession, m, latent, scaled, t, latentH, latentW, uncondEmbedding)
                         val g = fitted.guidance
                         for (i in eps.indices) eps[i] = epsUncond[i] + g * (eps[i] - epsUncond[i])
                     }
-                    native.step(latent!!, eps, t, prev, scheduler)
+                    native.step(latent, eps, t, prev, scheduler)
                     stepIndex += 1
                     Log.i(TAG, "step $stepIndex/${timesteps.size} done at ${elapsed(started)} ms")
                     onProgress(GenerationProgress(GenerationStage.DIFFUSING, stepIndex, fitted.steps, elapsed(started)))
@@ -244,14 +253,18 @@ class OnnxDiffusionEngine(
                 onProgress(GenerationProgress(GenerationStage.DECODING, fitted.steps, fitted.steps, elapsed(started)))
                 val diffusionDone = SystemClock.elapsedRealtime()
                 val decodeStarted = SystemClock.elapsedRealtime()
-                val bitmap = decodeLatents(envLocal, vae, m, latent!!, fitted.width, fitted.height)
+                val bitmap = decodeLatents(envLocal, vae, m, latent, fitted.width, fitted.height)
                 Log.i(TAG, "vae decode took ${SystemClock.elapsedRealtime() - decodeStarted} ms")
-                latent = null
 
                 // ---- 4. Persist -------------------------------------------------------------
                 onProgress(GenerationProgress(GenerationStage.SAVING, fitted.steps, fitted.steps, elapsed(started)))
-                val file = imageStore.save(bitmap, seed)
-                bitmap.recycle()
+                // finally, not a bare call: a failed PNG write used to strand a full-resolution
+                // bitmap until the next GC pass.
+                val file = try {
+                    imageStore.save(bitmap, seed)
+                } finally {
+                    bitmap.recycle()
+                }
                 onProgress(GenerationProgress(GenerationStage.DONE, fitted.steps, fitted.steps, elapsed(started)))
 
                 val decodeDone = SystemClock.elapsedRealtime()
@@ -279,7 +292,6 @@ class OnnxDiffusionEngine(
                 Log.e(TAG, "Generation failed", t)
                 GenerationResult.Failed(t.message ?: t.javaClass.simpleName, t)
             } finally {
-                latent = null
                 // Force the collectors to hand memory back before the next request arrives.
                 System.gc()
             }
@@ -360,12 +372,14 @@ class OnnxDiffusionEngine(
         session: OrtSession,
         m: ModelManifest,
         latent: FloatArray,
+        scaled: FloatArray,
         timestep: Int,
         latentH: Int,
         latentW: Int,
         embedding: FloatArray
     ): FloatArray {
-        val scaled = FloatArray(latent.size) { latent[it] * LcmScheduler.LATENT_SCALE }
+        require(scaled.size == latent.size) { "scratch buffer must match the latent size" }
+        for (i in latent.indices) scaled[i] = latent[i] * LcmScheduler.LATENT_SCALE
         val inputs = HashMap<String, OnnxTensor>()
         try {
             inputs[m.unet.inputNames.getOrElse(0) { "sample" }] = OnnxTensor.createTensor(
@@ -415,6 +429,15 @@ class OnnxDiffusionEngine(
         }
 
         val plane = width * height
+        // The decoder's output is trusted to be 3 x H x W. It is not always: a model with a
+        // different VAE scale factor produces a differently sized buffer, and indexing it blindly
+        // crashed the process with an ArrayIndexOutOfBounds instead of reporting the mismatch.
+        if (pixels.size < plane * 3) {
+            throw IllegalStateException(
+                "VAE decoder returned ${pixels.size} values for a ${width}x$height image " +
+                    "(expected ${plane * 3}). This model's VAE does not match the 8x latent grid."
+            )
+        }
         val argb = IntArray(plane)
         for (i in 0 until plane) {
             val r = toByte(pixels[i])
@@ -457,6 +480,16 @@ class OnnxDiffusionEngine(
     }
 
     private fun elapsed(started: Long) = SystemClock.elapsedRealtime() - started
+
+    /** One true sentence about why the engine cannot generate right now. */
+    private fun notReadyReason(status: EngineStatus): String = when (status) {
+        is EngineStatus.WeightsMissing -> status.detail
+        is EngineStatus.Failed -> "The local engine could not start: ${status.detail}"
+        EngineStatus.Loading -> "The local engine is still loading the model."
+        EngineStatus.Uninitialised ->
+            "The local engine is not running. Open the app again to reload the model."
+        is EngineStatus.Ready -> "The local engine is not ready."
+    }
 
     /**
      * The prompt the text encoder sees for the conditional pass: the user's words plus the

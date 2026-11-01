@@ -49,6 +49,25 @@ class LcmSchedulerTest {
         assertEquals(1.0, scheduler.sqrtAlphaPrev(-1), 0.0)
     }
 
+
+    @Test
+    fun `every step count the app offers produces a valid schedule`() {
+        for (steps in 1..12) {
+            val timesteps = scheduler.timesteps(steps)
+            assertEquals(steps, timesteps.size)
+            assertEquals(999, timesteps.first())
+            for (i in timesteps.indices) {
+                assertTrue("timestep $i out of range", timesteps[i] in 0..999)
+                if (i > 0) assertTrue("must strictly descend", timesteps[i] < timesteps[i - 1])
+            }
+        }
+    }
+
+    @Test
+    fun `a zero step count does not divide by zero`() {
+        assertEquals(1, scheduler.timesteps(0).size)
+    }
+
     @Test
     fun `a step is a pure function of its inputs`() {
         val a = floatArrayOf(1.2f, -0.7f, 0.33f)

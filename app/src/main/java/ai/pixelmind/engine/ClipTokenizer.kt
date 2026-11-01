@@ -20,7 +20,15 @@ class ClipTokenizer(
     eosToken: String = "<|endoftext|>",
     padToken: String = "<|endoftext|>"
 ) {
-    private val cache = HashMap<String, List<String>>()
+    /**
+     * BPE results, bounded. Prompts are short and repeat (history, retries), so the cache earns
+     * its keep — but an unbounded map on a long-lived process is a slow leak, and it is touched
+     * from the generation coroutine, so every access is guarded.
+     */
+    private val cache = object : LinkedHashMap<String, List<String>>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<String>>): Boolean =
+            size > CACHE_LIMIT
+    }
     private val byteEncoder: Map<Byte, String> = buildByteEncoder()
 
     private val bosId = encoder[bosToken] ?: 49406
@@ -47,7 +55,9 @@ class ClipTokenizer(
         // CLIP lowercases before BPE; doing it here means every caller gets the same tokens.
         val lowered = text.lowercase()
         val tokens = ArrayList<String>()
-        for (match in PATTERN.toRegex().findAll(lowered)) {
+        // Compiled once. Rebuilding the Regex on every call put a full pattern compile inside
+        // every generation, for a pattern that never changes.
+        for (match in PATTERN_REGEX.findAll(lowered)) {
             val mapped = buildString {
                 for (b in match.value.toByteArray(Charsets.UTF_8)) append(byteEncoder[b] ?: "")
             }
@@ -58,10 +68,10 @@ class ClipTokenizer(
 
     private fun bpeWord(token: String): List<String> {
         if (token.isEmpty()) return emptyList()
-        cache[token]?.let { return it }
+        synchronized(cache) { cache[token] }?.let { return it }
         if (token.length == 1) {
             val single = listOf(token + END_OF_WORD)
-            cache[token] = single
+            synchronized(cache) { cache[token] = single }
             return single
         }
 
@@ -105,7 +115,7 @@ class ClipTokenizer(
             if (word.size == 1) break
             pairs = getPairs(word)
         }
-        cache[token] = word
+        synchronized(cache) { cache[token] = word }
         return word
     }
 
@@ -122,10 +132,13 @@ class ClipTokenizer(
     companion object {
         private const val END_OF_WORD = "</w>"
         private const val PAIR_SEPARATOR = '\u0000'
+        private const val CACHE_LIMIT = 2048
 
         // The exact pattern OpenAI's CLIP uses to pre-split text before BPE.
         private const val PATTERN =
             "<\\|startoftext\\|>|<\\|endoftext\\|>|'s|'t|'re|'ve|'m|'ll|'d|[\\p{L}]+|[\\p{N}]|[^\\s\\p{L}\\p{N}]+"
+
+        private val PATTERN_REGEX = Regex(PATTERN)
 
         private fun bytesToUnicode(): Pair<List<Int>, List<String>> {
             val bs = mutableListOf<Int>()

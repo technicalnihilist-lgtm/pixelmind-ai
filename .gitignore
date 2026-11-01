@@ -1,0 +1,25 @@
+# Gradle / Android build output
+.gradle/
+build/
+app/build/
+modelpack/build/
+captures/
+*.apk
+*.aab
+*.aar
+
+# Machine-specific SDK location
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Python caches for the model tooling
+__pycache__/
+*.pyc
+
+# Keystores and signing material
+*.jks
+*.keystore
