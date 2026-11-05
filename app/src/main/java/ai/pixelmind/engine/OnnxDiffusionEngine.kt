@@ -82,17 +82,28 @@ class OnnxDiffusionEngine(
                     val located = resolution.located
                     manifest = located.manifest
                     buildSessions(located.dir, located.manifest)
-                    currentStatus = EngineStatus.Ready(
-                        info = requireNotNull(modelInfo),
-                        accelerator = accelerator
-                    )
+                    // No requireNotNull here. A missing ModelInfo is a state the engine can reach
+                    // (a manifest whose numbers do not add up leaves it unset), and turning that
+                    // into an NPE from inside the initialiser surfaced as a failure card reading
+                    // "null" with the sessions still open and unreachable.
+                    val info = modelInfo
+                    currentStatus = if (info != null) {
+                        EngineStatus.Ready(info, accelerator)
+                    } else {
+                        releaseInternal()
+                        EngineStatus.Failed(
+                            "The model opened but produced no metadata. Its manifest is incomplete."
+                        )
+                    }
                 }
             }
             currentStatus
         } catch (t: Throwable) {
+            // Logged before it is mapped: an OutOfMemoryError has no message of its own, so the
+            // stack trace is the only record of which allocation failed.
             Log.e(TAG, "Engine initialisation failed", t)
             releaseInternal()
-            currentStatus = EngineStatus.Failed(t.message ?: t.javaClass.simpleName)
+            currentStatus = EngineStatus.Failed(describeFailure(t))
             currentStatus
         }
     }
@@ -141,12 +152,17 @@ class OnnxDiffusionEngine(
                 lastError = null
                 break
             } catch (t: Throwable) {
-                Log.w(TAG, "Accelerator $name unavailable, falling back", t)
+                // An OOM here is not "this accelerator is unavailable": the next attempt allocates
+                // the same sessions and fails the same way, so it is logged at error level and
+                // stops the fallback chain instead of being retried twice more.
+                if (t is OutOfMemoryError) Log.e(TAG, "Out of memory building the $name sessions", t)
+                else Log.w(TAG, "Accelerator $name unavailable, falling back", t)
                 runCatching { encoder?.close() }
                 runCatching { unetSession?.close() }
                 runCatching { vaeSession?.close() }
                 runCatching { options.close() }
                 lastError = t
+                if (t is OutOfMemoryError) break
             }
         }
         lastError?.let { throw it }
@@ -191,18 +207,22 @@ class OnnxDiffusionEngine(
         synchronized(lock) {
             // Re-checked under the lock: release() may have closed the sessions between the check
             // above and this point (the app going to background while a request is queued).
-            if (!currentStatus.isReady) {
+            // The snapshot is taken once and used for the whole pass, so a release() landing
+            // mid-run cannot leave a half-null field set behind; if any piece is missing the pass
+            // fails with a sentence instead of an NPE from a requireNotNull.
+            val sessions = loadedSessions()
+            if (!currentStatus.isReady || sessions == null) {
                 return@withContext GenerationResult.Failed(notReadyReason(currentStatus))
             }
             val started = SystemClock.elapsedRealtime()
             val seed = fitted.resolvedSeed()
             try {
-                val m = requireNotNull(manifest)
-                val tok = requireNotNull(tokenizer)
-                val envLocal = requireNotNull(env)
-                val enc = requireNotNull(textEncoder)
-                val unetSession = requireNotNull(unet)
-                val vae = requireNotNull(vaeDecoder)
+                val m = sessions.manifest
+                val tok = sessions.tokenizer
+                val envLocal = sessions.env
+                val enc = sessions.textEncoder
+                val unetSession = sessions.unet
+                val vae = sessions.vaeDecoder
 
                 onProgress(GenerationProgress(GenerationStage.PREPARING, 0, fitted.steps, 0))
 
@@ -290,11 +310,15 @@ class OnnxDiffusionEngine(
                 GenerationResult.Cancelled
             } catch (t: Throwable) {
                 Log.e(TAG, "Generation failed", t)
-                GenerationResult.Failed(t.message ?: t.javaClass.simpleName, t)
-            } finally {
-                // Force the collectors to hand memory back before the next request arrives.
-                System.gc()
+                GenerationResult.Failed(describeFailure(t), t)
             }
+            // System.gc() used to sit in a finally block here. It forced a full stop-the-world
+            // collection after every generation, on the same thread pool that runs the next one,
+            // and nothing in this pipeline needs it: the latents, the embedding and the decoded
+            // bitmap are all unreachable by the time this block is reached, so ART's concurrent
+            // collector reclaims them at its own pace. Removing it has not been measured on a
+            // device (see docs/MEASUREMENTS.md); it is removed because the alternative — keeping
+            // an explicit GC on the strength of a guess — is the less defensible default.
         }
     }
 
@@ -342,7 +366,10 @@ class OnnxDiffusionEngine(
             }
             Log.i(TAG, "warm-up finished in ${SystemClock.elapsedRealtime() - started} ms ($accelerator)")
         } catch (t: Throwable) {
-            Log.w(TAG, "warm-up failed; generation will still be attempted", t)
+            // A warm-up that runs out of memory means the real generation will too; that is worth
+            // an error-level line rather than the same warning as an unsupported operator.
+            if (t is OutOfMemoryError) Log.e(TAG, "warm-up ran out of memory", t)
+            else Log.w(TAG, "warm-up failed; generation will still be attempted", t)
         }
     }
 
@@ -472,6 +499,32 @@ class OnnxDiffusionEngine(
         tokenizer = null
         manifest = null
     }
+
+    /**
+     * One consistent view of everything a generation needs, or null if the engine is not loaded.
+     *
+     * Every field is @Volatile-unsafe on its own (they are written under [lock] by buildSessions
+     * and cleared by releaseInternal), so reading them together under the same lock is what makes
+     * "the engine is ready" and "these sessions exist" the same statement.
+     */
+    private fun loadedSessions(): LoadedSessions? {
+        val e = env ?: return null
+        val m = manifest ?: return null
+        val t = tokenizer ?: return null
+        val te = textEncoder ?: return null
+        val u = unet ?: return null
+        val v = vaeDecoder ?: return null
+        return LoadedSessions(e, m, t, te, u, v)
+    }
+
+    private data class LoadedSessions(
+        val env: OrtEnvironment,
+        val manifest: ModelManifest,
+        val tokenizer: ClipTokenizer,
+        val textEncoder: OrtSession,
+        val unet: OrtSession,
+        val vaeDecoder: OrtSession
+    )
 
     private fun FloatBuffer.copyOut(): FloatArray {
         val copy = FloatArray(remaining())
