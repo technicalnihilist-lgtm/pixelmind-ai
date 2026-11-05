@@ -48,6 +48,13 @@ drops 45–60% for a Compose app of this shape, putting the APK around 12–14 M
 | `:app:mergeExtDexRelease` | 3m 43s |
 | `:app:assembleRelease` (no R8) | 2m 22s |
 
+## Deliberate non-measurements
+
+| Decision | What was and was not established |
+| --- | --- |
+| `System.gc()` removed from the end of `OnnxDiffusionEngine.generate` (Day 1, item 7) | Not measured: no device and no weights to run, so there is no before/after number for peak RSS or time-to-next-generation. It was removed because the call forced a full stop-the-world collection after every generation on the same thread pool that runs the next one, and because every large buffer it was reaching for (latents, text embedding, decoded bitmap) is already unreachable at that point. If a device measurement later shows a genuine memory plateau, this entry is the place to record the counter-evidence. |
+| Release APK built with R8 disabled | Measured: 23,287,301 bytes (22.2 MB) with `isMinifyEnabled = false` via a machine-local init script. Not measured: the R8-minified size on this host — R8 needs more than five minutes here (two cores, 2 GB), and a single command on this build pod is capped at 300 s. `BUILD.md` documents the same constraint for the artifact in `release/`. |
+
 ## Not measured
 
 | Metric | Why |
