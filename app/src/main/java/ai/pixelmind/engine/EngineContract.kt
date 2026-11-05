@@ -80,6 +80,24 @@ sealed interface EngineStatus {
 }
 
 /**
+ * Turns a thrown failure into one sentence a user can act on.
+ *
+ * `t.message ?: "unknown"` was used everywhere, which meant an [OutOfMemoryError] — whose message
+ * is null on ART — reached the failure card as the bare word "OutOfMemoryError", and an
+ * allocation failure deep inside ONNX Runtime reached it as whatever native string happened to be
+ * in flight. The mapping is deliberately small: it only claims things that are true.
+ */
+internal fun describeFailure(t: Throwable): String = when (t) {
+    is OutOfMemoryError ->
+        "The device ran out of memory while running the model. Close other apps and try again."
+    is SecurityException ->
+        "The app is not allowed to read the model files. Reinstall the app to restore them."
+    is java.io.FileNotFoundException ->
+        "A model file could not be opened. It may have been removed; reimport the model."
+    else -> t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
+}
+
+/**
  * The only surface the rest of the app is allowed to touch. Everything about ONNX Runtime,
  * tensor layouts and quantisation lives behind this interface, so the UI layer stays light
  * and the backend can be swapped without touching a single Composable.
