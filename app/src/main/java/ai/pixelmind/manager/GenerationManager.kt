@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Owns the generation queue. The UI submits a request and watches state; it never talks to
@@ -61,6 +62,14 @@ class GenerationManager(
     private var activeTask: CoroutineJob? = null
     private var nextId = 1L
 
+    /**
+     * True once [releaseEngine] has taken effect, so a second `onStop` is a no-op.
+     *
+     * Starts true: nothing is loaded at construction, so the first background transition has
+     * nothing to release. [ensureReady] clears it whenever it leaves a loaded engine behind.
+     */
+    private val engineReleased = AtomicBoolean(true)
+
     private val _modelInfo = MutableStateFlow<ModelInfo?>(null)
     val modelInfo: StateFlow<ModelInfo?> = _modelInfo.asStateFlow()
 
@@ -79,6 +88,8 @@ class GenerationManager(
         val status = engine.initialize()
         _engineStatus.value = status
         _modelInfo.value = engine.modelInfo()
+        // Only a loaded engine is something a release has to undo.
+        engineReleased.set(!status.isReady)
         status
     }
 
@@ -125,8 +136,26 @@ class GenerationManager(
         return ensureReady()
     }
 
+    /**
+     * Drops the loaded sessions when the app leaves the foreground. Safe to call repeatedly: a
+     * second `onStop` without an intervening load does nothing, where it used to queue another
+     * `engine.release()` behind the engine lock for no reason.
+     */
     fun releaseEngine() {
+        if (!engineReleased.compareAndSet(false, true)) return
+        // A job that is mid-flight when the app backgrounds is being cancelled by this call, so it
+        // is recorded as cancelled rather than left RUNNING forever (the engine will report "not
+        // running" for it a moment later, and the failure card would then blame the user's prompt).
+        val inFlight = activeJob
         activeTask?.cancel()
+        if (inFlight != null) {
+            updateJob(
+                inFlight.id,
+                JobState.CANCELLED,
+                "Cancelled because the app went to the background."
+            )
+        }
+        _progress.value = null
         _engineStatus.value = EngineStatus.Uninitialised
         _modelInfo.value = null
         // engine.release() takes the engine lock, which an in-flight generation holds until it
@@ -136,6 +165,30 @@ class GenerationManager(
     }
 
     private suspend fun runJob(job: Job) {
+        // A job queued before the app was backgrounded reaches the engine after its sessions have
+        // been released, and used to fail with "open the app again to reload the model" while the
+        // app was open and could reload it. Loading first is what the caller would have had to do.
+        val status = ensureReady()
+        if (!status.isReady) {
+            val reason = when (status) {
+                is EngineStatus.WeightsMissing -> status.detail
+                is EngineStatus.Failed -> status.detail
+                EngineStatus.Loading -> "The local engine is still loading the model."
+                EngineStatus.Uninitialised ->
+                    "The local engine is not running. Open the app again to reload the model."
+                is EngineStatus.Ready -> "The local engine is not ready."
+            }
+            updateJob(job.id, JobState.FAILED, reason)
+            _progress.value = null
+            results.trySend(GenerationResult.Failed(reason))
+            return
+        }
+        // A job cancelled while it sat in the queue (the queue is drained one id at a time, so a
+        // cancel can land between the enqueue and this line) must not start running afterwards.
+        if (_jobs.value.firstOrNull { it.id == job.id }?.state == JobState.CANCELLED) {
+            _progress.value = null
+            return
+        }
         updateJob(job.id, JobState.RUNNING)
         activeJob = job
         _lastResult.value = null
