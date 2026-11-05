@@ -19,16 +19,16 @@ A run takes the **next ten unchecked items**, top to bottom.
 
 ## Day 1 — crash and lifecycle sweep
 
-- [ ] 1. Audit every `!!` and `requireNotNull` in the engine; replace with explicit failure states where a user could trigger them.
-- [ ] 2. Ensure `OnnxDiffusionEngine.generate` cannot leak `OnnxTensor`/`Result` on the exception path (close in `finally`, not only on success).
-- [ ] 3. Handle configuration change (rotation) during generation without restarting the job.
-- [ ] 4. Handle process death mid-generation: no half-written PNG left in the gallery.
-- [ ] 5. Guard `GenerationManager.runJob` against the engine being released while a job is in flight.
-- [ ] 6. Make `PixelMindApp` lifecycle observer idempotent (repeated `onStop` must not double-release).
-- [ ] 7. Replace `System.gc()` after generation with a measured, documented alternative or justify keeping it.
-- [ ] 8. Audit every `catch (t: Throwable)` — none should swallow an `OutOfMemoryError` silently.
-- [ ] 9. Verify `MainActivity` survives `savedInstanceState` restoration with an in-flight job.
-- [ ] 10. Add a unit test for the provisioning helper's failure path (read-only directory, truncated asset).
+- [x] 1. Audit every `!!` and `requireNotNull` in the engine; replace with explicit failure states where a user could trigger them.
+- [x] 2. Ensure `OnnxDiffusionEngine.generate` cannot leak `OnnxTensor`/`Result` on the exception path (close in `finally`, not only on success).
+- [x] 3. Handle configuration change (rotation) during generation without restarting the job.
+- [x] 4. Handle process death mid-generation: no half-written PNG left in the gallery.
+- [x] 5. Guard `GenerationManager.runJob` against the engine being released while a job is in flight.
+- [x] 6. Make `PixelMindApp` lifecycle observer idempotent (repeated `onStop` must not double-release).
+- [x] 7. Replace `System.gc()` after generation with a measured, documented alternative or justify keeping it.
+- [x] 8. Audit every `catch (t: Throwable)` — none should swallow an `OutOfMemoryError` silently.
+- [x] 9. Verify `MainActivity` survives `savedInstanceState` restoration with an in-flight job.
+- [x] 10. Add a unit test for the provisioning helper's failure path (read-only directory, truncated asset).
 
 ## Day 2 — concurrency
 
@@ -283,3 +283,4 @@ A run takes the **next ten unchecked items**, top to bottom.
 
 | Day | Date | Items done | Tests | APK size | Notes |
 | --- | --- | --- | --- | --- | --- |
+| 1 | 5 Nov 2026 | 1–10 | 34/34 pass (`:app:testReleaseUnitTest`) | 23,287,301 bytes (22.2 MB), arm64-v8a, no bundled weights | Crash/lifecycle sweep. 7 `requireNotNull` sites became explicit `EngineStatus.Failed` states; new `describeFailure` maps OOM/SecurityException/FileNotFound to actionable sentences and OOM is logged at error level instead of being retried as a fallback; post-generation `System.gc()` removed (see docs/MEASUREMENTS.md); `ImageStore.save` stages to `*.part` and renames; `releaseEngine` is idempotent and marks the in-flight job CANCELLED; a queued job reloads the engine instead of failing with a false "open the app again". Items 2, 3 and 9 were already handled / inspection-verified only — no device or emulator. Tests 25 → 34. APK built with R8 disabled via a machine-local init script (R8 needs >5 min on this 2-core build pod, whose commands are capped at 300 s); repo build config unchanged. |
