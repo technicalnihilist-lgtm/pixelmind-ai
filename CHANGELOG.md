@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.1.7 — crash and lifecycle sweep (Day 1 of the optimisation backlog)
+
+Maintenance release. No UI, feature, model-format or permission changes; the app still declares no
+platform permissions and no `INTERNET`.
+
+* **The engine no longer throws out of its own initialiser.** Seven `requireNotNull` call sites in
+  `OnnxDiffusionEngine` became explicit `EngineStatus.Failed` states, so a half-built session set is
+  reported as a failure with a sentence instead of an `IllegalArgumentException` from inside
+  `initialize()`.
+* **Failures are described, not echoed.** A new `describeFailure` maps an `OutOfMemoryError`, a
+  `SecurityException` and a missing model file to actionable text; an out-of-memory kill used to
+  reach the failure card as the bare string "OutOfMemoryError".
+* **Out of memory is no longer treated as an accelerator fallback.** It is logged at error level and
+  stops the XNNPACK → NNAPI → CPU chain instead of being retried twice more.
+* **`System.gc()` after every generation is gone.** The reasoning (and the fact that it is
+  unmeasured on a device) is recorded in `docs/MEASUREMENTS.md`.
+* **A process death cannot leave a half-written PNG in the gallery.** `ImageStore.save` encodes into
+  a `*.part` staging file and renames it into place; abandoned staging files are swept on the next
+  save and excluded from the storage totals.
+* **Releasing the engine is idempotent.** A repeated `onStop` no longer queues a second
+  `engine.release()` behind the engine lock, and a generation that was in flight when the app went
+  to the background is recorded as cancelled rather than left running or blamed on the prompt.
+* **A queued job no longer fails with a false message.** It reloads the model first, instead of
+  reporting "open the app again" while the app is open.
+
+Tests: 34 (25 existing + `ProvisioningTest`, `FailureDescriptionTest`).
+
 ## 1.1.6 — stability pass: engine lifecycle, model repair, import integrity
 
 A maintenance release. No UI, feature, model-format or permission changes — the app still
