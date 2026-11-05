@@ -29,10 +29,41 @@ class ImageStore(private val context: Context) {
         while (file.exists()) {
             file = File(root, "pm_${stamp}_${seed}_${attempt++}.png")
         }
-        FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        // Compressed straight into a staging file and renamed into place. A process kill partway
+        // through the encode used to leave a truncated "pm_....png" in the gallery directory that
+        // looked like a real image to every reader (totalBytes, count, a stale database row) but
+        // decoded to nothing. Only the rename makes it visible, and a rename is atomic.
+        val staging = File(root, "${file.name}.part")
+        try {
+            FileOutputStream(staging).use { out ->
+                if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+                    throw java.io.IOException("the image could not be encoded as PNG")
+                }
+                out.flush()
+            }
+            if (!staging.renameTo(file)) {
+                // Some filesystems refuse a rename onto a fresh path; the copy is still staged.
+                staging.copyTo(file, overwrite = true)
+                staging.delete()
+            }
+        } catch (t: Throwable) {
+            runCatching { staging.delete() }
+            throw t
         }
+        sweepStaging()
         return file
+    }
+
+    /**
+     * Removes staging files abandoned by a previous process death.
+     *
+     * Generation is serialised by [ai.pixelmind.manager.GenerationManager] — one save at a time —
+     * so any `.part` file present at the start of a save belongs to a run that never finished.
+     * Nothing else in the app writes into this directory.
+     */
+    private fun sweepStaging() {
+        root.listFiles { f -> f.isFile && f.name.endsWith(".part") }
+            ?.forEach { runCatching { it.delete() } }
     }
 
     fun load(path: String, maxEdge: Int = 1080): Bitmap? {
@@ -59,9 +90,9 @@ class ImageStore(private val context: Context) {
     }
 
     fun totalBytes(): Long =
-        root.listFiles()?.sumOf { it.length() } ?: 0L
+        root.listFiles { f -> f.isFile && !f.name.endsWith(".part") }?.sumOf { it.length() } ?: 0L
 
-    fun count(): Int = root.listFiles()?.size ?: 0
+    fun count(): Int = root.listFiles { f -> f.isFile && !f.name.endsWith(".part") }?.size ?: 0
 
     private fun cacheSizeKb(): Int {
         val maxKb = (Runtime.getRuntime().maxMemory() / 1024).toInt()
