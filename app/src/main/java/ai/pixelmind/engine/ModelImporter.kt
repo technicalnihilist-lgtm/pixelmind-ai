@@ -103,11 +103,20 @@ class ModelImporter(private val context: Context) {
         previous.renameTo(root)
     }
 
-    fun discardPrevious() {
+    /**
+     * Drops the copy kept for rollback. Deleting a model directory is a few hundred megabytes of
+     * unlink work, and this was called straight from the ViewModel's coroutine — i.e. on the main
+     * thread — right after a successful import. It now runs on IO like every other file operation
+     * in this class.
+     */
+    suspend fun discardPrevious() = withContext(Dispatchers.IO) {
         previous.deleteRecursively()
     }
 
-    fun activeModelBytes(): Long = root.listFiles()?.sumOf { it.length() } ?: 0L
+    /** Bytes on disk for the active model. File-system walk, so it runs on IO. */
+    suspend fun activeModelBytes(): Long = withContext(Dispatchers.IO) {
+        root.listFiles()?.sumOf { it.length() } ?: 0L
+    }
 
     // ---------------------------------------------------------------------------------------
     // internals

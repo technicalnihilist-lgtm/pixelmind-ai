@@ -116,6 +116,12 @@ interface LocalAIEngine {
         onProgress: (GenerationProgress) -> Unit
     ): GenerationResult
 
-    /** Frees sessions, tensors and native arenas. Called when the app goes to background. */
-    fun release()
+    /**
+     * Frees sessions, tensors and native arenas. Called when the app goes to background.
+     *
+     * Suspending rather than blocking: the engine serialises a generation against this call, so a
+     * blocking release would park the caller's thread (on the main thread, for a whole diffusion
+     * step) waiting for the gate. Suspending lets the caller be cancelled or moved instead.
+     */
+    suspend fun release()
 }

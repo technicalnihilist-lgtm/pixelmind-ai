@@ -13,7 +13,7 @@ import kotlinx.coroutines.withContext
 class PixelMindRepository(
     private val db: PixelMindDb,
     private val imageStore: ImageStore
-) {
+) : GenerationRecorder {
     private val _generations = MutableStateFlow<List<GenerationRecord>>(emptyList())
     val generations: StateFlow<List<GenerationRecord>> = _generations.asStateFlow()
 
@@ -25,7 +25,7 @@ class PixelMindRepository(
         _promptHistory.value = db.recentPrompts(30)
     }
 
-    suspend fun record(request: GenerationRequest, image: GeneratedImage) = withContext(Dispatchers.IO) {
+    override suspend fun record(request: GenerationRequest, image: GeneratedImage) = withContext(Dispatchers.IO) {
         db.insertGeneration(
             GenerationRecord(
                 id = 0,

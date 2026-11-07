@@ -32,16 +32,16 @@ A run takes the **next ten unchecked items**, top to bottom.
 
 ## Day 2 — concurrency
 
-- [ ] 11. Make `GenerationManager.cancelActive` cancel the actual worker job, not a wrapper that has already completed.
-- [ ] 12. Prove queue ordering is FIFO under concurrent `enqueue` calls; add a test.
-- [ ] 13. Ensure `retry` cannot run a job twice if tapped quickly.
-- [ ] 14. Replace `synchronized(lock)` around the whole generation with a `Mutex`, so cancellation is not blocked by the lock.
-- [ ] 15. Ensure progress callbacks never arrive after the job is marked finished.
-- [ ] 16. Make `engineStatus` transitions monotonic — no `Ready → Loading` flicker while a job runs.
-- [ ] 17. Audit `Dispatchers.Default` vs `IO` usage across engine, importer and repository.
-- [ ] 18. Ensure `SharedFlow`/`Channel` result events cannot be dropped when the UI is not collecting.
-- [ ] 19. Guard against two `initialize()` calls racing (double session creation).
-- [ ] 20. Add a stress test that enqueues 50 jobs and asserts exactly 50 terminal states.
+- [x] 11. Make `GenerationManager.cancelActive` cancel the actual worker job, not a wrapper that has already completed.
+- [x] 12. Prove queue ordering is FIFO under concurrent `enqueue` calls; add a test.
+- [x] 13. Ensure `retry` cannot run a job twice if tapped quickly.
+- [x] 14. Replace `synchronized(lock)` around the whole generation with a `Mutex`, so cancellation is not blocked by the lock.
+- [x] 15. Ensure progress callbacks never arrive after the job is marked finished.
+- [x] 16. Make `engineStatus` transitions monotonic — no `Ready → Loading` flicker while a job runs.
+- [x] 17. Audit `Dispatchers.Default` vs `IO` usage across engine, importer and repository.
+- [x] 18. Ensure `SharedFlow`/`Channel` result events cannot be dropped when the UI is not collecting.
+- [x] 19. Guard against two `initialize()` calls racing (double session creation).
+- [x] 20. Add a stress test that enqueues 50 jobs and asserts exactly 50 terminal states.
 
 ## Day 3 — memory
 
@@ -284,3 +284,4 @@ A run takes the **next ten unchecked items**, top to bottom.
 | Day | Date | Items done | Tests | APK size | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 5 Nov 2026 | 1–10 | 34/34 pass (`:app:testReleaseUnitTest`) | 23,287,301 bytes (22.2 MB), arm64-v8a, no bundled weights | Crash/lifecycle sweep. 7 `requireNotNull` sites became explicit `EngineStatus.Failed` states; new `describeFailure` maps OOM/SecurityException/FileNotFound to actionable sentences and OOM is logged at error level instead of being retried as a fallback; post-generation `System.gc()` removed (see docs/MEASUREMENTS.md); `ImageStore.save` stages to `*.part` and renames; `releaseEngine` is idempotent and marks the in-flight job CANCELLED; a queued job reloads the engine instead of failing with a false "open the app again". Items 2, 3 and 9 were already handled / inspection-verified only — no device or emulator. Tests 25 → 34. APK built with R8 disabled via a machine-local init script (R8 needs >5 min on this 2-core build pod, whose commands are capped at 300 s); repo build config unchanged. |
+| 2 | 7 Nov 2026 | 11–20 | 48/48 pass (`:app:testReleaseUnitTest`) | 23,287,301 bytes (22.2 MB), arm64-v8a, no bundled weights | Concurrency. Real bugs: `nextId++` raced (duplicate ids) and the job-list append was a lost update, so a concurrent enqueue could leave an id in the work channel with no job behind it; a cancelled queued job could be re-sent and run twice; `cancelActive` could land in the gap between marking a job RUNNING and storing the worker handle, so the cancel did nothing and the job ran to completion under a CANCELLED label; result events were `Channel.BUFFERED` (64) with `trySend`, so a burst with no collector dropped the tail; the engine held a monitor for the whole pass so `release()` blocked the main thread, and `ImageStore.save`/`discardPrevious()` did I/O on the wrong dispatcher. Terminal job states are now final, progress is gated on a per-execution flag, and `ensureReady` adopts a live ready engine instead of repainting Loading. Items 11 and 19 were partly already handled — the cancel did target the real worker, and the engine gate already serialised two initialises; both are now proven by test rather than by argument. Tests 34 → 48 (`GenerationQueueTest`, `EngineStatusReducerTest`). No device or emulator: no timing, memory or cancellation-latency claim is made. See docs/CONCURRENCY.md. APK built with R8 disabled via the same machine-local init script as Day 1 (R8 exceeds the pod's 300 s command ceiling); repo build config unchanged. |

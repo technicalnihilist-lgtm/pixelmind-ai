@@ -8,14 +8,17 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 import java.util.Random
-import kotlin.coroutines.coroutineContext
+import kotlin.coroutines.CoroutineContext
 import kotlin.math.min
 
 /**
@@ -52,7 +55,17 @@ class OnnxDiffusionEngine(
     private var accelerator: String = "CPU"
 
     private val scheduler = LcmScheduler()
-    private val lock = Any()
+
+    /**
+     * Serialises session construction, generation and release.
+     *
+     * A [Mutex] rather than a monitor: a generation holds this for the whole diffusion pass, and a
+     * monitor made `release()` block whichever thread called it (the main thread, from
+     * `ProcessLifecycleOwner.onStop`) until the pass finished. With a mutex the release suspends
+     * instead, and — more importantly — cancelling the generating coroutine releases the gate at
+     * once, because the between-steps cancellation check throws out of `withLock`.
+     */
+    private val gate = Mutex()
     private val native = NativeScheduler
 
     override fun status(): EngineStatus = currentStatus
@@ -64,7 +77,7 @@ class OnnxDiffusionEngine(
         // release() and against a second concurrent initialise. Without that, a background
         // transition arriving mid-load (release() runs while the sessions are being built) leaves
         // one set of sessions open and unreachable, and the status flips back to Ready afterwards.
-        synchronized(lock) { initialiseLocked() }
+        gate.withLock { initialiseLocked() }
     }
 
     private fun initialiseLocked(): EngineStatus {
@@ -204,122 +217,164 @@ class OnnxDiffusionEngine(
             Log.i(TAG, "Request scaled to ${fitted.width}x${fitted.height} @ ${fitted.steps} steps")
         }
 
-        synchronized(lock) {
-            // Re-checked under the lock: release() may have closed the sessions between the check
-            // above and this point (the app going to background while a request is queued).
-            // The snapshot is taken once and used for the whole pass, so a release() landing
-            // mid-run cannot leave a half-null field set behind; if any piece is missing the pass
-            // fails with a sentence instead of an NPE from a requireNotNull.
-            val sessions = loadedSessions()
-            if (!currentStatus.isReady || sessions == null) {
-                return@withContext GenerationResult.Failed(notReadyReason(currentStatus))
-            }
-            val started = SystemClock.elapsedRealtime()
-            val seed = fitted.resolvedSeed()
-            try {
-                val m = sessions.manifest
-                val tok = sessions.tokenizer
-                val envLocal = sessions.env
-                val enc = sessions.textEncoder
-                val unetSession = sessions.unet
-                val vae = sessions.vaeDecoder
+        // Captured before the gate: the gated section is a plain lambda, so this is how the
+        // between-steps cancellation check survives inside it.
+        val jobContext = coroutineContext
+        val started = SystemClock.elapsedRealtime()
+        val seed = fitted.resolvedSeed()
 
-                onProgress(GenerationProgress(GenerationStage.PREPARING, 0, fitted.steps, 0))
+        val pass = try {
+            gate.withLock { runPass(jobContext, fitted, seed, started, onProgress) }
+        } catch (c: CancellationException) {
+            Pass.Cancelled
+        } catch (t: Throwable) {
+            Log.e(TAG, "Generation failed", t)
+            Pass.Failed(describeFailure(t))
+        }
 
-                // ---- 1. Text conditioning -------------------------------------------------
-                onProgress(GenerationProgress(GenerationStage.ENCODING_TEXT, 0, fitted.steps, elapsed(started)))
-                val textStarted = SystemClock.elapsedRealtime()
-                val condEmbedding = runTextEncoder(envLocal, enc, m, tok, fitted.conditionalText())
-                val uncondEmbedding = if (fitted.guidance > 1.05f) {
-                    runTextEncoder(envLocal, enc, m, tok, fitted.negativePrompt.trim())
-                } else null
-
-                Log.i(TAG, "text encoding took ${SystemClock.elapsedRealtime() - textStarted} ms")
-
-                // ---- 2. Diffusion loop ----------------------------------------------------
-                val textDone = SystemClock.elapsedRealtime()
-                val timesteps = scheduler.timesteps(fitted.steps)
-                val latentH = fitted.height / 8
-                val latentW = fitted.width / 8
-                val latentSize = m.latentChannels * latentH * latentW
-
-                val latent = FloatArray(latentSize)
-                val rng = Random(seed)
-                val scale = scheduler.initialNoiseScale(timesteps[0]).toFloat()
-                for (i in latent.indices) latent[i] = (rng.nextGaussian().toFloat() * scale)
-                // One scratch buffer for the VAE-scaled copy the UNet sees, reused by every step
-                // instead of a fresh array per UNet call (two calls per step, plus the uncond pass).
-                val scaled = FloatArray(latentSize)
-
-                var stepIndex = 0
-                while (stepIndex < timesteps.size) {
-                    coroutineContext.ensureActive() // cancellation is honoured between steps
-                    val t = timesteps[stepIndex]
-                    val prev = if (stepIndex + 1 < timesteps.size) timesteps[stepIndex + 1] else -1
-
-                    val eps = runUnet(envLocal, unetSession, m, latent, scaled, t, latentH, latentW, condEmbedding)
-                    if (uncondEmbedding != null) {
-                        val epsUncond = runUnet(envLocal, unetSession, m, latent, scaled, t, latentH, latentW, uncondEmbedding)
-                        val g = fitted.guidance
-                        for (i in eps.indices) eps[i] = epsUncond[i] + g * (eps[i] - epsUncond[i])
-                    }
-                    native.step(latent, eps, t, prev, scheduler)
-                    stepIndex += 1
-                    Log.i(TAG, "step $stepIndex/${timesteps.size} done at ${elapsed(started)} ms")
-                    onProgress(GenerationProgress(GenerationStage.DIFFUSING, stepIndex, fitted.steps, elapsed(started)))
-                }
-
-                // ---- 3. Decode --------------------------------------------------------------
-                onProgress(GenerationProgress(GenerationStage.DECODING, fitted.steps, fitted.steps, elapsed(started)))
-                val diffusionDone = SystemClock.elapsedRealtime()
-                val decodeStarted = SystemClock.elapsedRealtime()
-                val bitmap = decodeLatents(envLocal, vae, m, latent, fitted.width, fitted.height)
-                Log.i(TAG, "vae decode took ${SystemClock.elapsedRealtime() - decodeStarted} ms")
-
-                // ---- 4. Persist -------------------------------------------------------------
-                onProgress(GenerationProgress(GenerationStage.SAVING, fitted.steps, fitted.steps, elapsed(started)))
-                // finally, not a bare call: a failed PNG write used to strand a full-resolution
-                // bitmap until the next GC pass.
+        when (pass) {
+            Pass.Cancelled -> GenerationResult.Cancelled
+            is Pass.Failed -> GenerationResult.Failed(pass.reason)
+            is Pass.Decoded -> {
+                onProgress(
+                    GenerationProgress(GenerationStage.SAVING, fitted.steps, fitted.steps, elapsed(started))
+                )
+                // PNG encode and the write are I/O, not compute. They used to run on the Default
+                // pool, which put a full-resolution encode in front of the next job's text
+                // encoding and made the queue look stalled after the ring had reached 97%.
                 val file = try {
-                    imageStore.save(bitmap, seed)
+                    withContext(Dispatchers.IO) { imageStore.save(pass.bitmap, pass.seed) }
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Could not write the PNG", t)
+                    return@withContext GenerationResult.Failed(describeFailure(t), t)
                 } finally {
-                    bitmap.recycle()
+                    pass.bitmap.recycle()
                 }
-                onProgress(GenerationProgress(GenerationStage.DONE, fitted.steps, fitted.steps, elapsed(started)))
-
+                onProgress(
+                    GenerationProgress(GenerationStage.DONE, fitted.steps, fitted.steps, elapsed(started))
+                )
                 val decodeDone = SystemClock.elapsedRealtime()
                 GenerationResult.Success(
                     image = GeneratedImage(
                         file = file,
                         width = fitted.width,
                         height = fitted.height,
-                        seed = seed,
+                        seed = pass.seed,
                         durationMs = elapsed(started)
                     ),
                     timings = RunTimings(
                         accelerator = accelerator,
-                        textEncodeMs = textDone - textStarted,
-                        diffusionMs = diffusionDone - textDone,
-                        decodeMs = decodeDone - diffusionDone,
+                        textEncodeMs = pass.textEncodeMs,
+                        diffusionMs = pass.diffusionMs,
+                        decodeMs = decodeDone - pass.diffusionDone,
                         steps = fitted.steps,
                         width = fitted.width,
                         height = fitted.height
                     )
                 )
-            } catch (c: kotlinx.coroutines.CancellationException) {
-                GenerationResult.Cancelled
-            } catch (t: Throwable) {
-                Log.e(TAG, "Generation failed", t)
-                GenerationResult.Failed(describeFailure(t), t)
             }
-            // System.gc() used to sit in a finally block here. It forced a full stop-the-world
-            // collection after every generation, on the same thread pool that runs the next one,
-            // and nothing in this pipeline needs it: the latents, the embedding and the decoded
-            // bitmap are all unreachable by the time this block is reached, so ART's concurrent
-            // collector reclaims them at its own pace. Removing it has not been measured on a
-            // device (see docs/MEASUREMENTS.md); it is removed because the alternative — keeping
-            // an explicit GC on the strength of a guess — is the less defensible default.
         }
+    }
+
+    /**
+     * Everything that needs the sessions, run under the gate. Returns the decoded bitmap rather
+     * than saving it: the save is I/O and belongs outside the section that holds the gate.
+     */
+    private fun runPass(
+        jobContext: CoroutineContext,
+        fitted: GenerationRequest,
+        seed: Long,
+        started: Long,
+        onProgress: (GenerationProgress) -> Unit
+    ): Pass {
+        // The snapshot is taken once and used for the whole pass, so a release() landing
+        // mid-run cannot leave a half-null field set behind; if any piece is missing the pass
+        // fails with a sentence instead of an NPE from a requireNotNull.
+        val sessions = loadedSessions()
+        if (!currentStatus.isReady || sessions == null) {
+            return Pass.Failed(notReadyReason(currentStatus))
+        }
+        val m = sessions.manifest
+        val tok = sessions.tokenizer
+        val envLocal = sessions.env
+        val enc = sessions.textEncoder
+        val unetSession = sessions.unet
+        val vae = sessions.vaeDecoder
+
+        onProgress(GenerationProgress(GenerationStage.PREPARING, 0, fitted.steps, 0))
+
+        // ---- 1. Text conditioning -----------------------------------------------------
+        onProgress(GenerationProgress(GenerationStage.ENCODING_TEXT, 0, fitted.steps, elapsed(started)))
+        val textStarted = SystemClock.elapsedRealtime()
+        val condEmbedding = runTextEncoder(envLocal, enc, m, tok, fitted.conditionalText())
+        val uncondEmbedding = if (fitted.guidance > 1.05f) {
+            runTextEncoder(envLocal, enc, m, tok, fitted.negativePrompt.trim())
+        } else null
+
+        Log.i(TAG, "text encoding took ${SystemClock.elapsedRealtime() - textStarted} ms")
+
+        // ---- 2. Diffusion loop --------------------------------------------------------
+        val textDone = SystemClock.elapsedRealtime()
+        val timesteps = scheduler.timesteps(fitted.steps)
+        val latentH = fitted.height / 8
+        val latentW = fitted.width / 8
+        val latentSize = m.latentChannels * latentH * latentW
+
+        val latent = FloatArray(latentSize)
+        val rng = Random(seed)
+        val scale = scheduler.initialNoiseScale(timesteps[0]).toFloat()
+        for (i in latent.indices) latent[i] = (rng.nextGaussian().toFloat() * scale)
+        // One scratch buffer for the VAE-scaled copy the UNet sees, reused by every step
+        // instead of a fresh array per UNet call (two calls per step, plus the uncond pass).
+        val scaled = FloatArray(latentSize)
+
+        var stepIndex = 0
+        while (stepIndex < timesteps.size) {
+            jobContext.ensureActive() // cancellation is honoured between steps
+            val t = timesteps[stepIndex]
+            val prev = if (stepIndex + 1 < timesteps.size) timesteps[stepIndex + 1] else -1
+
+            val eps = runUnet(envLocal, unetSession, m, latent, scaled, t, latentH, latentW, condEmbedding)
+            if (uncondEmbedding != null) {
+                val epsUncond = runUnet(envLocal, unetSession, m, latent, scaled, t, latentH, latentW, uncondEmbedding)
+                val g = fitted.guidance
+                for (i in eps.indices) eps[i] = epsUncond[i] + g * (eps[i] - epsUncond[i])
+            }
+            native.step(latent, eps, t, prev, scheduler)
+            stepIndex += 1
+            Log.i(TAG, "step $stepIndex/${timesteps.size} done at ${elapsed(started)} ms")
+            onProgress(GenerationProgress(GenerationStage.DIFFUSING, stepIndex, fitted.steps, elapsed(started)))
+        }
+
+        // ---- 3. Decode -----------------------------------------------------------------
+        onProgress(GenerationProgress(GenerationStage.DECODING, fitted.steps, fitted.steps, elapsed(started)))
+        val diffusionDone = SystemClock.elapsedRealtime()
+        val decodeStarted = SystemClock.elapsedRealtime()
+        val bitmap = decodeLatents(envLocal, vae, m, latent, fitted.width, fitted.height)
+        Log.i(TAG, "vae decode took ${SystemClock.elapsedRealtime() - decodeStarted} ms")
+
+        return Pass.Decoded(
+            bitmap = bitmap,
+            seed = seed,
+            textEncodeMs = textDone - textStarted,
+            diffusionMs = diffusionDone - textDone,
+            diffusionDone = diffusionDone
+        )
+    }
+
+    /** What the gated half of a generation produced. */
+    private sealed interface Pass {
+        data class Failed(val reason: String) : Pass
+        data object Cancelled : Pass
+        data class Decoded(
+            val bitmap: Bitmap,
+            val seed: Long,
+            val textEncodeMs: Long,
+            val diffusionMs: Long,
+            val diffusionDone: Long
+        ) : Pass
     }
 
     /**
@@ -480,8 +535,8 @@ class OnnxDiffusionEngine(
         return (normalised * 255f + 0.5f).toInt()
     }
 
-    override fun release() {
-        synchronized(lock) {
+    override suspend fun release() {
+        gate.withLock {
             releaseInternal()
             currentStatus = EngineStatus.Uninitialised
         }

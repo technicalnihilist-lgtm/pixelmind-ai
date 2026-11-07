@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.2.0 — concurrency (Day 2 of the optimisation backlog)
+
+Maintenance release. No UI, feature, model-format or permission changes; the app still declares no
+platform permissions and no `INTERNET`.
+
+* **Concurrent enqueue no longer corrupts the queue.** `nextId++` on a plain `Long` could hand two
+  callers the same id, and the job-list append was a lost update, which could leave an id in the work
+  channel with no job record behind it — the drain loop then skipped that job silently. Id
+  assignment, the list append and the channel send now happen under one lock, and the ids are
+  allocated atomically.
+* **A retried job cannot run twice.** A cancelled queued job could be re-sent to the work channel
+  while its original id was still buffered there. A pending set now keeps at most one copy of an id
+  in the channel.
+* **Cancel actually cancels.** The job was marked RUNNING and the worker handle was stored in two
+  separate steps, so a cancel landing in between found nothing to cancel and the generation ran to
+  completion under a "cancelled" label. The worker is created lazily and published with the state
+  change in one critical section.
+* **Terminal states are final.** A cancelled job is no longer relabelled by the result that arrives
+  while the engine unwinds.
+* **Progress cannot reopen after a job finished.** Late callbacks are dropped.
+* **Results are no longer dropped when nobody is collecting.** The result channel was buffered at 64
+  and written with `trySend`, so a burst of queued jobs lost the tail of its events.
+* **Releasing the engine no longer blocks a thread.** The engine's monitor became a `Mutex` and
+  `LocalAIEngine.release()` is now `suspend`; a release during a generation suspends instead of
+  parking the caller (which was the main thread, from `ProcessLifecycleOwner.onStop`).
+* **I/O moved off the compute pool.** The PNG encode and write run on `Dispatchers.IO`, and
+  `ModelImporter.discardPrevious()` no longer deletes a model directory on the main thread.
+* **The status pill cannot flicker back to Loading** over a model that is already in memory.
+
+Tests: 48 (34 existing + `GenerationQueueTest`, `EngineStatusReducerTest`). See
+`docs/CONCURRENCY.md` for what each item turned out to be and for what is still unmeasured.
+
 ## 1.1.7 — crash and lifecycle sweep (Day 1 of the optimisation backlog)
 
 Maintenance release. No UI, feature, model-format or permission changes; the app still declares no
