@@ -48,14 +48,10 @@ class MemoryGuard(context: Context) {
      * costs in RAM once loaded. The workspace terms scale with both output resolution and model
      * complexity: a toy graph has tiny activations, a 600 MB UNet has very large ones.
      */
-    fun estimatePeakMb(width: Int, height: Int, steps: Int, weightsMb: Double): Int {
-        val megapixels = (width.toLong() * height.toLong()) / 262_144.0 // 512x512 == 1.0
-        val complexity = (weightsMb / 640.0).coerceIn(0.15, 1.0)
-        val activations = megapixels * 180.0 * complexity
-        val decode = megapixels * 120.0 * complexity
-        val overhead = 60.0 + steps * 2
-        return (weightsMb + activations + decode + overhead).toInt()
-    }
+    fun estimatePeakMb(width: Int, height: Int, steps: Int, weightsMb: Double): Int =
+        // The arithmetic lives in MemoryEstimate so it can be asserted in a JVM test and quoted
+        // in docs/MEASUREMENTS.md; this class only supplies the device figures it is fed.
+        MemoryEstimate.peakMb(width, height, steps, weightsMb)
 
     /**
      * Returns the request adjusted down until it fits, or null when even the floor configuration

@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.2.1 — memory (Day 3 of the optimisation backlog)
+
+Maintenance release. No UI, feature, model-format or permission changes; the app still declares no
+platform permissions and no `INTERNET`.
+
+* **The tokenizer no longer hangs.** `ClipTokenizer` split a `left\u0000right` rank key by taking its
+  last character as the right half, so no adjacent pair ever matched, every merge was a no-op, and a
+  word containing any ranked pair looped for ever — with the real CLIP merge table that is nearly
+  every prompt word. The key is now split on the separator, and a merge that removes nothing breaks
+  out instead of spinning.
+* **UNet outputs are read, not copied.** Each of the two UNet calls per step allocated a fresh
+  `FloatArray` for its output; the graph's buffer is now read into a caller-owned array, and the VAE
+  decode reads its three channel planes straight out of the tensor instead of copying 3×W×H floats
+  first. A payload of the wrong length now fails with a message naming the graph and both sizes
+  instead of an `ArrayIndexOutOfBoundsException` thrown several statements later.
+* **One working set per pass, released on every exit.** The latent, the VAE-scaled copy, both eps
+  outputs and the decode scratch live in one `DiffusionBuffers` set allocated once per generation and
+  dropped on the success, failure and cancellation paths alike. Previously two of the five were
+  reallocated per step.
+* **The preview cache is sized against the right budget.** It was a fraction of the Java heap, which
+  no longer holds bitmap pixels, and had no cap; it is now derived from the heap class and physical
+  RAM, halved on low-RAM devices, clamped to 4–24 MB, and counts sub-kilobyte entries instead of
+  rounding them to zero.
+* **Cache keys record the decoded size.** The key was the file path, so whichever size decoded first
+  answered every later request — a 256 px detail decode could satisfy a 1080 px grid request. Deleting
+  an image now drops every cached size of it, not one.
+* **A cancelled job stops before it builds a bitmap.** Cancellation is checked after the decoder call
+  and before the full-resolution pixel array and `Bitmap` are allocated, and the SAVING progress
+  callback now runs inside the `try` that recycles the bitmap.
+* **Text embeddings are dropped before the decode** instead of being held across it.
+* **`lastResult` is gone.** It was written on every job and read by nothing, retaining the last
+  `GenerationResult` — and on failure the `Throwable` with its stack trace — for the life of the
+  process.
+
+Tests: 68 (48 existing + `DiffusionBuffersTest`, `MemoryEstimateTest`, `PreviewCachePolicyTest`, and
+three tokenizer cases). See `docs/MEASUREMENTS.md` for the memory estimates and for what is still
+unmeasured without a device.
+
 ## 1.2.0 — concurrency (Day 2 of the optimisation backlog)
 
 Maintenance release. No UI, feature, model-format or permission changes; the app still declares no

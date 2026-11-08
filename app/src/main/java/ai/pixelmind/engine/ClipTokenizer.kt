@@ -31,6 +31,12 @@ class ClipTokenizer(
     }
     private val byteEncoder: Map<Byte, String> = buildByteEncoder()
 
+    /**
+     * Words currently held by the BPE cache. Exists so the bound can be asserted in a test
+     * rather than trusted from the `removeEldestEntry` above; nothing in the app reads it.
+     */
+    internal fun cachedWordCount(): Int = synchronized(cache) { cache.size }
+
     private val bosId = encoder[bosToken] ?: 49406
     private val eosId = encoder[eosToken] ?: 49407
     private val padId = encoder[padToken] ?: 49407
@@ -90,8 +96,16 @@ class ClipTokenizer(
                 }
             }
             val merged = best ?: break
-            val first = merged.substring(0, merged.length - 1)
-            val second = merged.substring(merged.length - 1)
+            // The rank key is "left\u0000right", so the halves are split on the separator. Taking
+            // "everything but the last character" as the left half and the last character as the
+            // right one — which is what this did — produced a `first` that still contained the
+            // separator and a one-character `second`. No adjacent pair ever matched, every merge
+            // was a no-op, and because the loop only exited when `best` was null, a word whose
+            // pairs were in the rank table spun for ever instead of tokenising.
+            val separator = merged.indexOf(PAIR_SEPARATOR)
+            if (separator < 0) break
+            val first = merged.substring(0, separator)
+            val second = merged.substring(separator + 1)
 
             val newWord = ArrayList<String>(word.size)
             var i = 0
@@ -111,6 +125,12 @@ class ClipTokenizer(
                     i += 1
                 }
             }
+            // A merge that removes nothing leaves `word` and `pairs` unchanged, so the next
+            // round picks the same rank again and the loop never terminates: a prompt tokenised
+            // with such a rank set pinned a core for ever, with no cancellation check to escape
+            // it. Every well-formed merge strictly shortens the word, so this only fires on a
+            // malformed or hand-edited merges.txt — which an imported model can carry.
+            if (newWord.size >= word.size) break
             word = newWord
             if (word.size == 1) break
             pairs = getPairs(word)

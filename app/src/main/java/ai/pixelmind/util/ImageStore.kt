@@ -1,5 +1,6 @@
 package ai.pixelmind.util
 
+import android.app.ActivityManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -16,8 +17,13 @@ class ImageStore(private val context: Context) {
     private val root: File
         get() = File(context.filesDir, "generations").apply { mkdirs() }
 
+    private val activityManager =
+        context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+
     private val previewCache = object : LruCache<String, Bitmap>(cacheSizeKb()) {
-        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
+        // Ceiling, not floor. Integer division used to count anything under a kilobyte as free,
+        // so a cache full of tiny thumbnails could hold more pixels than the budget allowed.
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.byteCount + 1023) / 1024
     }
 
     fun save(bitmap: Bitmap, seed: Long): File {
@@ -66,26 +72,44 @@ class ImageStore(private val context: Context) {
             ?.forEach { runCatching { it.delete() } }
     }
 
+    /**
+     * Decodes [path] at no more than [maxEdge] on its longer edge, through the cache.
+     *
+     * The cache is keyed by the *decoded* size, not the requested one, so a thumbnail and a
+     * full-size preview of the same file coexist instead of evicting one another.
+     */
     fun load(path: String, maxEdge: Int = 1080): Bitmap? {
-        previewCache.get(path)?.let { return it }
         val file = File(path)
         if (!file.exists()) return null
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, bounds)
-        var sample = 1
-        while (bounds.outWidth / sample > maxEdge || bounds.outHeight / sample > maxEdge) sample *= 2
+        val sample = PreviewCachePolicy.sampleSize(bounds.outWidth, bounds.outHeight, maxEdge)
+        val key = PreviewCachePolicy.key(path, sample)
+
+        previewCache.get(key)?.let { return it }
+
         val bitmap = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }) ?: return null
-        previewCache.put(path, bitmap)
+        previewCache.put(key, bitmap)
         return bitmap
     }
 
     fun loadThumbnail(path: String, maxEdge: Int = 320): Bitmap? = load(path, maxEdge)
 
+    /**
+     * Deletes the file and every cached decode of it.
+     *
+     * A file has one entry per size it was ever decoded at, so removing the single key the path
+     * used to be left the other sizes in the cache: a deleted image stayed resident (and was
+     * still returned for its path) until the LRU happened to evict it.
+     */
     fun delete(path: String): Boolean {
-        previewCache.remove(path)
+        val prefix = PreviewCachePolicy.prefix(path)
+        previewCache.snapshot()?.keys
+            ?.filter { it.startsWith(prefix) }
+            ?.forEach { previewCache.remove(it) }
         return File(path).delete()
     }
 
@@ -94,8 +118,21 @@ class ImageStore(private val context: Context) {
 
     fun count(): Int = root.listFiles { f -> f.isFile && !f.name.endsWith(".part") }?.size ?: 0
 
+    /**
+     * Budget for the decode cache, from the device's heap class *and* its physical RAM.
+     *
+     * Bitmap pixels are native memory from API 26 onwards, so the heap class alone is not the
+     * budget: see [PreviewCachePolicy] for the derivation and the absolute cap.
+     */
     private fun cacheSizeKb(): Int {
-        val maxKb = (Runtime.getRuntime().maxMemory() / 1024).toInt()
-        return maxKb / 8
+        val am = activityManager ?: return PreviewCachePolicy.MIN_KB
+        val info = ActivityManager.MemoryInfo()
+        runCatching { am.getMemoryInfo(info) }
+        val totalRamMb = (info.totalMem / 1_048_576L).toInt()
+        return PreviewCachePolicy.budgetKb(
+            memoryClassMb = am.memoryClass,
+            totalRamMb = totalRamMb,
+            isLowRam = am.isLowRamDevice
+        )
     }
 }

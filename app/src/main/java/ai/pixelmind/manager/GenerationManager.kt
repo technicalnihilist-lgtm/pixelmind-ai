@@ -70,8 +70,12 @@ class GenerationManager(
     private val _progress = MutableStateFlow<GenerationProgress?>(null)
     val progress: StateFlow<GenerationProgress?> = _progress.asStateFlow()
 
-    private val _lastResult = MutableStateFlow<GenerationResult?>(null)
-    val lastResult: StateFlow<GenerationResult?> = _lastResult.asStateFlow()
+    // There used to be a `lastResult: StateFlow<GenerationResult?>` here, written on every
+    // finished job and read by nothing: the UI reacts to `resultEvents` instead. It held the last
+    // GenerationResult — and on the failure path the Throwable with its stack trace — for the
+    // rest of the process lifetime. A result is a one-shot event; the queue no longer keeps a
+    // copy of one. Nothing in a result holds a Bitmap either: GeneratedImage carries the saved
+    // File, and the decoded bitmap is recycled inside the engine.
 
     /**
      * Unbounded on purpose. With a bounded buffer, `trySend` silently dropped results whenever
@@ -291,7 +295,6 @@ class GenerationManager(
             activeJob = job
             activeTask = task
         }
-        _lastResult.value = null
         task.start()
         try {
             task.join()
@@ -342,7 +345,6 @@ class GenerationManager(
             is GenerationResult.Failed -> finishJob(job.id, JobState.FAILED, result.reason)
             GenerationResult.Cancelled -> finishJob(job.id, JobState.CANCELLED)
         }
-        _lastResult.value = result
         results.trySend(result)
     }
 

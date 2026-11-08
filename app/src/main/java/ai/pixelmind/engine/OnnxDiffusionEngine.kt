@@ -236,13 +236,18 @@ class OnnxDiffusionEngine(
             Pass.Cancelled -> GenerationResult.Cancelled
             is Pass.Failed -> GenerationResult.Failed(pass.reason)
             is Pass.Decoded -> {
-                onProgress(
-                    GenerationProgress(GenerationStage.SAVING, fitted.steps, fitted.steps, elapsed(started))
-                )
                 // PNG encode and the write are I/O, not compute. They used to run on the Default
                 // pool, which put a full-resolution encode in front of the next job's text
                 // encoding and made the queue look stalled after the ring had reached 97%.
+                //
+                // The bitmap is recycled on every exit from this branch, and the SAVING progress
+                // callback is inside the try for a reason: it runs on the caller's dispatcher and
+                // a cancellation delivered there used to skip the `finally` that covered only the
+                // save, leaving a full-resolution ARGB_8888 bitmap alive until the next GC.
                 val file = try {
+                    onProgress(
+                        GenerationProgress(GenerationStage.SAVING, fitted.steps, fitted.steps, elapsed(started))
+                    )
                     withContext(Dispatchers.IO) { imageStore.save(pass.bitmap, pass.seed) }
                 } catch (c: CancellationException) {
                     throw c
@@ -297,71 +302,132 @@ class OnnxDiffusionEngine(
             return Pass.Failed(notReadyReason(currentStatus))
         }
         val m = sessions.manifest
-        val tok = sessions.tokenizer
-        val envLocal = sessions.env
-        val enc = sessions.textEncoder
-        val unetSession = sessions.unet
-        val vae = sessions.vaeDecoder
 
         onProgress(GenerationProgress(GenerationStage.PREPARING, 0, fitted.steps, 0))
 
-        // ---- 1. Text conditioning -----------------------------------------------------
-        onProgress(GenerationProgress(GenerationStage.ENCODING_TEXT, 0, fitted.steps, elapsed(started)))
-        val textStarted = SystemClock.elapsedRealtime()
-        val condEmbedding = runTextEncoder(envLocal, enc, m, tok, fitted.conditionalText())
-        val uncondEmbedding = if (fitted.guidance > 1.05f) {
-            runTextEncoder(envLocal, enc, m, tok, fitted.negativePrompt.trim())
-        } else null
-
-        Log.i(TAG, "text encoding took ${SystemClock.elapsedRealtime() - textStarted} ms")
-
-        // ---- 2. Diffusion loop --------------------------------------------------------
-        val textDone = SystemClock.elapsedRealtime()
-        val timesteps = scheduler.timesteps(fitted.steps)
-        val latentH = fitted.height / 8
-        val latentW = fitted.width / 8
-        val latentSize = m.latentChannels * latentH * latentW
-
-        val latent = FloatArray(latentSize)
-        val rng = Random(seed)
-        val scale = scheduler.initialNoiseScale(timesteps[0]).toFloat()
-        for (i in latent.indices) latent[i] = (rng.nextGaussian().toFloat() * scale)
-        // One scratch buffer for the VAE-scaled copy the UNet sees, reused by every step
-        // instead of a fresh array per UNet call (two calls per step, plus the uncond pass).
-        val scaled = FloatArray(latentSize)
-
-        var stepIndex = 0
-        while (stepIndex < timesteps.size) {
-            jobContext.ensureActive() // cancellation is honoured between steps
-            val t = timesteps[stepIndex]
-            val prev = if (stepIndex + 1 < timesteps.size) timesteps[stepIndex + 1] else -1
-
-            val eps = runUnet(envLocal, unetSession, m, latent, scaled, t, latentH, latentW, condEmbedding)
-            if (uncondEmbedding != null) {
-                val epsUncond = runUnet(envLocal, unetSession, m, latent, scaled, t, latentH, latentW, uncondEmbedding)
-                val g = fitted.guidance
-                for (i in eps.indices) eps[i] = epsUncond[i] + g * (eps[i] - epsUncond[i])
-            }
-            native.step(latent, eps, t, prev, scheduler)
-            stepIndex += 1
-            Log.i(TAG, "step $stepIndex/${timesteps.size} done at ${elapsed(started)} ms")
-            onProgress(GenerationProgress(GenerationStage.DIFFUSING, stepIndex, fitted.steps, elapsed(started)))
-        }
+        // ---- 1-2. Text conditioning and the diffusion loop -------------------------------
+        //
+        // Both live in one call so the two text embeddings become unreachable the moment the
+        // last step has been taken. With classifier-free guidance on they are 2 x 77 x 768
+        // floats, the largest Kotlin-side buffers of a pass, and the decoder does not need them:
+        // holding them across a full-resolution VAE decode was memory kept for nothing. The
+        // OnnxTensor wrappers were already closed per call, so what this frees is the copied-out
+        // float data rather than a leaked tensor handle.
+        val diffusion = diffuse(jobContext, sessions, fitted, seed, started, onProgress)
 
         // ---- 3. Decode -----------------------------------------------------------------
         onProgress(GenerationProgress(GenerationStage.DECODING, fitted.steps, fitted.steps, elapsed(started)))
         val diffusionDone = SystemClock.elapsedRealtime()
         val decodeStarted = SystemClock.elapsedRealtime()
-        val bitmap = decodeLatents(envLocal, vae, m, latent, fitted.width, fitted.height)
+        val bitmap = try {
+            decodeLatents(
+                env = sessions.env,
+                session = sessions.vaeDecoder,
+                m = m,
+                buffers = diffusion.buffers,
+                width = fitted.width,
+                height = fitted.height,
+                jobContext = jobContext
+            )
+        } finally {
+            // The decoder is the last reader of the latent, so the whole working set goes here —
+            // on the cancelled and failed paths as well as the successful one.
+            diffusion.buffers.release()
+        }
         Log.i(TAG, "vae decode took ${SystemClock.elapsedRealtime() - decodeStarted} ms")
 
         return Pass.Decoded(
             bitmap = bitmap,
             seed = seed,
-            textEncodeMs = textDone - textStarted,
-            diffusionMs = diffusionDone - textDone,
+            textEncodeMs = diffusion.textEncodeMs,
+            diffusionMs = diffusion.diffusionMs,
             diffusionDone = diffusionDone
         )
+    }
+
+    /** What the denoising half of a pass produced, and the buffers it produced it in. */
+    private class Diffusion(
+        val buffers: DiffusionBuffers,
+        val textEncodeMs: Long,
+        val diffusionMs: Long
+    )
+
+    /**
+     * Text conditioning plus the whole denoising loop.
+     *
+     * The caller keeps the returned buffers (the decoder still needs the latent) and releases
+     * them; everything else allocated here — both embeddings, the timestep array, the RNG — is
+     * unreachable as soon as this returns.
+     */
+    private fun diffuse(
+        jobContext: CoroutineContext,
+        sessions: LoadedSessions,
+        fitted: GenerationRequest,
+        seed: Long,
+        started: Long,
+        onProgress: (GenerationProgress) -> Unit
+    ): Diffusion {
+        val m = sessions.manifest
+        val env = sessions.env
+        val latentH = fitted.height / 8
+        val latentW = fitted.width / 8
+        val latentSize = m.latentChannels * latentH * latentW
+        val buffers = DiffusionBuffers(latentSize)
+        try {
+            onProgress(GenerationProgress(GenerationStage.ENCODING_TEXT, 0, fitted.steps, elapsed(started)))
+            val textStarted = SystemClock.elapsedRealtime()
+            val condEmbedding = runTextEncoder(
+                env, sessions.textEncoder, m, sessions.tokenizer, fitted.conditionalText()
+            )
+            val uncondEmbedding = if (fitted.guidance > 1.05f) {
+                runTextEncoder(
+                    env, sessions.textEncoder, m, sessions.tokenizer, fitted.negativePrompt.trim()
+                )
+            } else null
+            val textDone = SystemClock.elapsedRealtime()
+            Log.i(TAG, "text encoding took ${textDone - textStarted} ms")
+
+            val timesteps = scheduler.timesteps(fitted.steps)
+            val latent = buffers.latent
+            val rng = Random(seed)
+            val scale = scheduler.initialNoiseScale(timesteps[0]).toFloat()
+            for (i in latent.indices) latent[i] = rng.nextGaussian().toFloat() * scale
+
+            // Every buffer the loop touches is allocated once, above, and reused by every step:
+            // `scaled` is the VAE-scaled copy the UNet reads, and the two eps buffers are filled
+            // in place by runUnet, which reads the graph's output straight into them instead of
+            // allocating a fresh FloatArray for each of the two calls per step.
+            val eps = buffers.conditionalEps
+            var stepIndex = 0
+            while (stepIndex < timesteps.size) {
+                jobContext.ensureActive() // cancellation is honoured between steps
+                val t = timesteps[stepIndex]
+                val prev = if (stepIndex + 1 < timesteps.size) timesteps[stepIndex + 1] else -1
+
+                runUnet(env, sessions.unet, m, latent, buffers.scaled, t, latentH, latentW, condEmbedding, eps)
+                if (uncondEmbedding != null) {
+                    val epsUncond = buffers.unconditionalEps
+                    runUnet(
+                        env, sessions.unet, m, latent, buffers.scaled, t, latentH, latentW,
+                        uncondEmbedding, epsUncond
+                    )
+                    val g = fitted.guidance
+                    for (i in eps.indices) eps[i] = epsUncond[i] + g * (eps[i] - epsUncond[i])
+                }
+                native.step(latent, eps, t, prev, scheduler)
+                stepIndex += 1
+                Log.i(TAG, "step $stepIndex/${timesteps.size} done at ${elapsed(started)} ms")
+                onProgress(GenerationProgress(GenerationStage.DIFFUSING, stepIndex, fitted.steps, elapsed(started)))
+            }
+
+            val diffusionDone = SystemClock.elapsedRealtime()
+            return Diffusion(buffers, textDone - textStarted, diffusionDone - textDone)
+        } catch (t: Throwable) {
+            // Cancelled between steps, or a graph failed. The buffers are not handed to anyone on
+            // this path, so they are dropped here rather than left for the collector to find.
+            buffers.release()
+            throw t
+        }
     }
 
     /** What the gated half of a generation produced. */
@@ -458,9 +524,11 @@ class OnnxDiffusionEngine(
         timestep: Int,
         latentH: Int,
         latentW: Int,
-        embedding: FloatArray
-    ): FloatArray {
+        embedding: FloatArray,
+        dest: FloatArray
+    ) {
         require(scaled.size == latent.size) { "scratch buffer must match the latent size" }
+        require(dest.size == latent.size) { "output buffer must match the latent size" }
         for (i in latent.indices) scaled[i] = latent[i] * LcmScheduler.LATENT_SCALE
         val inputs = HashMap<String, OnnxTensor>()
         try {
@@ -482,23 +550,70 @@ class OnnxDiffusionEngine(
             session.run(inputs).use { result ->
                 val out = result.get(m.unet.outputName)
                     .orElseThrow { IllegalStateException("UNet produced no output") } as OnnxTensor
-                return out.floatBuffer.copyOut()
+                // Read into the caller's buffer rather than copying out into a new array: ONNX
+                // Runtime hands back a FloatBuffer over the tensor's own memory, so this is the
+                // one copy the JVM cannot avoid and not the second one it used to make.
+                out.floatBuffer.copyInto(dest, "UNet", latentH, latentW, m.latentChannels)
             }
         } finally {
             inputs.values.forEach { runCatching { it.close() } }
         }
     }
 
+    /**
+     * Copies a graph's float payload into [dest], refusing a payload of the wrong length.
+     *
+     * The size check is not defensive padding: a UNet whose output does not match the latent
+     * used to index past the end of the buffer several statements later, which surfaced as an
+     * `ArrayIndexOutOfBoundsException` from the scheduler rather than as the model mismatch it is.
+     */
+    private fun FloatBuffer.copyInto(
+        dest: FloatArray,
+        graph: String,
+        latentH: Int,
+        latentW: Int,
+        channels: Int
+    ) {
+        val available = remaining()
+        if (available != dest.size) {
+            throw IllegalStateException(
+                "$graph returned $available values, but a ${channels}x${latentH}x${latentW} tensor " +
+                    "needs ${dest.size}. This model's tensor contract does not match the pipeline; " +
+                    "import a model exported for PixelMind."
+            )
+        }
+        duplicate().get(dest)
+    }
+
+    /**
+     * Decodes the latent to an ARGB bitmap.
+     *
+     * Two things keep this from holding memory the request no longer needs: the channel planes
+     * are read straight out of the decoder's output buffer instead of being copied into a
+     * 3 x H x W FloatArray first, and cancellation is checked before the full-resolution pixel
+     * array and the bitmap are allocated — a job cancelled during the (uninterruptible) decoder
+     * call used to go on to build both of them.
+     */
     private fun decodeLatents(
         env: OrtEnvironment,
         session: OrtSession,
         m: ModelManifest,
-        latent: FloatArray,
+        buffers: DiffusionBuffers,
         width: Int,
-        height: Int
+        height: Int,
+        jobContext: CoroutineContext
     ): Bitmap {
-        val unscaled = FloatArray(latent.size) { latent[it] / LcmScheduler.LATENT_SCALE }
-        val pixels = OnnxTensor.createTensor(
+        val latent = buffers.latent
+        val unscaled = buffers.decodeScratch
+        for (i in latent.indices) unscaled[i] = latent[i] / LcmScheduler.LATENT_SCALE
+
+        val plane = width * height
+        // Nothing below can be interrupted once the decoder starts, so the last chance to give
+        // up cheaply is now, before a megabyte of pixels and a bitmap are built.
+        jobContext.ensureActive()
+        val argb = IntArray(plane)
+
+        OnnxTensor.createTensor(
             env,
             FloatBuffer.wrap(unscaled),
             longArrayOf(1, m.latentChannels.toLong(), (height / 8).toLong(), (width / 8).toLong())
@@ -506,26 +621,26 @@ class OnnxDiffusionEngine(
             session.run(mapOf(m.vaeDecoder.inputNames[0] to tensor)).use { result ->
                 val out = result.get(m.vaeDecoder.outputName)
                     .orElseThrow { IllegalStateException("VAE decoder produced no output") } as OnnxTensor
-                out.floatBuffer.copyOut()
+                val pixels = out.floatBuffer
+                val base = pixels.position()
+                // The decoder's output is trusted to be 3 x H x W. It is not always: a model with
+                // a different VAE scale factor produces a differently sized buffer, and indexing
+                // it blindly crashed the process with an ArrayIndexOutOfBounds instead of
+                // reporting the mismatch.
+                if (pixels.remaining() < plane * 3) {
+                    throw IllegalStateException(
+                        "VAE decoder returned ${pixels.remaining()} values for a ${width}x$height " +
+                            "image (expected ${plane * 3}). This model's VAE does not match the 8x " +
+                            "latent grid."
+                    )
+                }
+                for (i in 0 until plane) {
+                    val r = toByte(pixels.get(base + i))
+                    val g = toByte(pixels.get(base + plane + i))
+                    val b = toByte(pixels.get(base + 2 * plane + i))
+                    argb[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                }
             }
-        }
-
-        val plane = width * height
-        // The decoder's output is trusted to be 3 x H x W. It is not always: a model with a
-        // different VAE scale factor produces a differently sized buffer, and indexing it blindly
-        // crashed the process with an ArrayIndexOutOfBounds instead of reporting the mismatch.
-        if (pixels.size < plane * 3) {
-            throw IllegalStateException(
-                "VAE decoder returned ${pixels.size} values for a ${width}x$height image " +
-                    "(expected ${plane * 3}). This model's VAE does not match the 8x latent grid."
-            )
-        }
-        val argb = IntArray(plane)
-        for (i in 0 until plane) {
-            val r = toByte(pixels[i])
-            val g = toByte(pixels[plane + i])
-            val b = toByte(pixels[2 * plane + i])
-            argb[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
         }
         return Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888)
     }
