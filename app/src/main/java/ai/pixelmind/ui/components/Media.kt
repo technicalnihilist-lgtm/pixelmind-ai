@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.Image
 import ai.pixelmind.PixelMindApp
+import ai.pixelmind.util.PreviewCachePolicy
 import ai.pixelmind.ui.theme.Palette
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -50,11 +51,18 @@ fun LocalImage(
     contentScale: ContentScale = ContentScale.Crop
 ) {
     val context = LocalContext.current
-    val store = remember(context) { (context.applicationContext as PixelMindApp).container.imageStore }
+    val container = remember(context) { (context.applicationContext as PixelMindApp).container }
+    val store = container.imageStore
+    // The caller asks for an edge; a low-RAM device gets a smaller decode of the same picture.
+    // Resolved once per composition rather than per draw, and it is what the decode cache is
+    // keyed on, so the two sizes never impersonate one another.
+    val edge = remember(maxEdge, container) {
+        PreviewCachePolicy.thumbnailEdge(maxEdge, container.memoryGuard.isLowRamDevice)
+    }
     var bitmap by remember(path) { mutableStateOf<android.graphics.Bitmap?>(null) }
 
-    LaunchedEffect(path, maxEdge) {
-        bitmap = withContext(Dispatchers.IO) { store.load(path, maxEdge) }
+    LaunchedEffect(path, edge) {
+        bitmap = withContext(Dispatchers.IO) { store.load(path, edge) }
     }
 
     Box(

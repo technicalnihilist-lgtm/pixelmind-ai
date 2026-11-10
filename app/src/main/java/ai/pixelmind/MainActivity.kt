@@ -5,6 +5,9 @@ import ai.pixelmind.ui.nav.PixelMindNav
 import ai.pixelmind.ui.theme.LiquidBackground
 import ai.pixelmind.ui.theme.PixelMindTheme
 import android.os.Bundle
+import android.os.Process
+import android.util.Log
+import android.view.Choreographer
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -45,6 +48,25 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+        // Logged, never shown: the one number in this app that cannot be measured without a
+        // device. See docs/MEASUREMENTS.md — the hook exists, the figure does not.
+        logTimeToFirstFrame()
+    }
+
+    /**
+     * Reports how long the first frame took, from process start rather than from `onCreate`.
+     *
+     * [Process.getStartUptimeMillis] is when the zygote forked this process, so the number covers
+     * class loading, `Application.onCreate` (which is where the engine used to start loading the
+     * model), activity creation and the first composition. It is written to logcat under the
+     * `ColdStart` tag; nothing on screen reads it.
+     */
+    private fun logTimeToFirstFrame() {
+        val processStart = Process.getStartUptimeMillis()
+        Choreographer.getInstance().postFrameCallback { frameTimeNanos ->
+            val firstFrameMs = frameTimeNanos / 1_000_000L - processStart
+            Log.i("ColdStart", "first frame ${firstFrameMs}ms after process start")
         }
     }
 }

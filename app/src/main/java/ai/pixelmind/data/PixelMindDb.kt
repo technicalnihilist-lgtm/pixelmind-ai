@@ -11,6 +11,33 @@ import android.database.sqlite.SQLiteOpenHelper
  */
 class PixelMindDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
 
+    init {
+        // Write-ahead logging. The gallery reads the whole record list on the main thread at
+        // start-up and after every delete while a generation writes its row on the IO dispatcher;
+        // under the default rollback journal the writer blocks every reader for the duration of
+        // the commit, and the reader blocks the writer. Under WAL they do not wait for each other.
+        // Set on the helper, before the database is opened, which is the documented place for it.
+        setWriteAheadLoggingEnabled(true)
+    }
+
+    override fun onConfigure(db: SQLiteDatabase) {
+        // Runs before onCreate, so the page size below is the one a fresh file is created with.
+        //
+        // SQLite's Java API exposes no "allocate N bytes now", so the file cannot literally be
+        // pre-sized; what this does is remove the two things that made it grow and shrink under
+        // the app: a 4 KB page (the default is 1 KB on some builds, which quadruples the number of
+        // page allocations for the same rows) and auto-vacuum, which returns freed pages to the
+        // filesystem and makes the next insert allocate again.
+        runCatching { db.execSQL("PRAGMA page_size = 4096") }
+        runCatching { db.execSQL("PRAGMA auto_vacuum = NONE") }
+        // Bound the -wal file. Left alone it grows until a checkpoint and can outgrow the database
+        // itself; 4 MB is far more than a burst of gallery writes needs.
+        runCatching { db.execSQL("PRAGMA journal_size_limit = 4194304") }
+        // Safe under WAL: a committed transaction survives a process kill, and only an OS crash
+        // can lose the last commits. It removes an fsync from every insert.
+        runCatching { db.execSQL("PRAGMA synchronous = NORMAL") }
+    }
+
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """

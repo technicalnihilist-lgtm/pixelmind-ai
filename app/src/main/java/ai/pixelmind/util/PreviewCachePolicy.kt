@@ -49,6 +49,24 @@ object PreviewCachePolicy {
         return sample
     }
 
+    /** Below this the thumbnail is too soft to be worth the memory it saves. */
+    const val MIN_EDGE = 96
+
+    /**
+     * Decode edge to actually use, given what the caller asked for.
+     *
+     * A 480 px grid thumbnail is 0.9 MB of ARGB_8888 pixels and a 1080 px detail view is 4.5 MB.
+     * On a device that has declared itself low-RAM — 1 GB or less, which is where the gallery is
+     * most likely to be evicted mid-scroll — those decodes were competing with the model's working
+     * set for the same memory, so the requested edge is halved. The images are the same images at
+     * the same size on screen; only the number of pixels decoded behind them changes.
+     */
+    fun thumbnailEdge(requested: Int, isLowRam: Boolean): Int {
+        if (requested <= 0) return MIN_EDGE
+        if (!isLowRam) return requested
+        return (requested / 2).coerceAtLeast(MIN_EDGE)
+    }
+
     /**
      * Cache key for one decoded size of one file.
      *
