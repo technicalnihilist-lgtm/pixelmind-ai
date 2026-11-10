@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.3.0 — startup and perceived performance (Day 4 of the optimisation backlog)
+
+Maintenance release. No UI, feature, model-format or permission changes; the app still declares no
+platform permissions and no `INTERNET`.
+
+* **The tokenizer is parsed by the first generation, not by opening the app.** `ClipTokenizer`'s
+  vocabulary (~49,000 entries) and merge table (~48,000 ranks) were parsed inside `buildSessions`,
+  which runs at launch and again on every return from background because the sessions are released
+  on stop. A user who opened the app to look at the gallery paid for it and never used it.
+* **Warm-up moved into the first pass.** The three graphs were exercised at session creation,
+  whether or not anything was ever generated; they are now warmed by the first generation, on
+  exactly the graphs that pass uses.
+* **Home no longer recomposes on every engine status and every step.** The screen body read
+  `engineStatus`, `modelInfo` and `progress`, so each diffusion step and each `Loading → Ready`
+  transition recomposed the headline, the prompt card and the gallery row. Those reads now live in
+  the four leaf composables that actually display them. Nothing moves on screen.
+* **Low-RAM devices decode smaller previews.** `LocalImage` used the requested edge everywhere, so
+  a low-RAM phone held the same 0.9 MB thumbnails and 4.5 MB detail decodes as a flagship while the
+  model's working set was live. The edge is halved on a device that reports `isLowRamDevice`,
+  floored at 96 px.
+* **SQLite runs in WAL mode.** The gallery's read and a generation's insert used to block each
+  other under the rollback journal, and auto-vacuum grew and shrank the file under the app. WAL, a
+  4 KB page size, auto-vacuum off, a 4 MB journal cap and `synchronous = NORMAL` replace that.
+* **Session creation is timed per graph.** Each of the three `createSession` calls logs its own
+  duration; the UNet dominates start-up and a single total did not say so.
+* **Two unused artifacts dropped.** `lifecycle-runtime-compose` (nothing calls
+  `collectAsStateWithLifecycle`) and `ui-tooling-preview` (there is no `@Preview`) are gone. The
+  release APK is 16,784 bytes smaller for it.
+* **Cold start is instrumented, not measured.** `MainActivity` logs process-start-to-first-frame
+  under the `ColdStart` tag. No device was available to read that number, and none is quoted.
+
 ## 1.2.1 — memory (Day 3 of the optimisation backlog)
 
 Maintenance release. No UI, feature, model-format or permission changes; the app still declares no

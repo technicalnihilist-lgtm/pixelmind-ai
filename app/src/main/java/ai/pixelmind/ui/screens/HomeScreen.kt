@@ -66,13 +66,13 @@ fun HomeScreen(
     onOpenGallery: () -> Unit
 ) {
     val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    // Only the flows this screen's own layout depends on are read here. The engine status, the
+    // model info and the generation progress are read by the three leaf composables below, so a
+    // status change repaints a pill and nothing else: this body used to read all three, which
+    // made every step of every generation — and every Loading → Ready transition — recompose the
+    // whole screen, headline and gallery row included.
     val studio by viewModel.studio.collectAsState()
-    val status by viewModel.engineStatus.collectAsState()
     val generations by viewModel.generations.collectAsState()
-    val progress by viewModel.progress.collectAsState()
-    val modelInfo by viewModel.modelInfo.collectAsState()
-
-    val busy = progress != null
 
     Column(
         modifier = Modifier
@@ -106,7 +106,7 @@ fun HomeScreen(
                 Spacer(Modifier.width(11.dp))
                 Text("PixelMind", style = MaterialTheme.typography.titleLarge)
             }
-            EngineStatusPill(status)
+            HomeStatusPill(viewModel)
         }
 
         Spacer(Modifier.height(30.dp))
@@ -149,49 +149,15 @@ fun HomeScreen(
                 }
             }
             Spacer(Modifier.height(16.dp))
-            GradientButton(
-                text = if (busy) "Generating on device…" else "Generate",
-                onClick = {
-                    if (busy) onOpenStudio() else viewModel.generate()
-                },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = studio.canGenerate || busy,
-                icon = Icons.Filled.PlayArrow
+            HomeGenerateButton(
+                viewModel = viewModel,
+                canGenerate = studio.canGenerate,
+                onOpenStudio = onOpenStudio
             )
         }
 
         // ---- honest model state ----------------------------------------------------------
-        AnimatedVisibility(visible = status is EngineStatus.WeightsMissing, enter = fadeIn(), exit = fadeOut()) {
-            Column {
-                Spacer(Modifier.height(14.dp))
-                GlassCard(isDark = isDark, tint = Palette.Amber, padding = PaddingValues(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Filled.Info,
-                            contentDescription = null,
-                            tint = Palette.Amber,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(Modifier.width(10.dp))
-                        Text("Model weights not installed", style = MaterialTheme.typography.titleMedium)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        (status as? EngineStatus.WeightsMissing)?.detail
-                            ?: "The bundled weights are missing from this build.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "PixelMind will not substitute stock images. Run tools/export_model.py and rebuild " +
-                            "to bundle the weights — see docs/MODEL.md.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-        }
+        MissingWeightsNotice(viewModel = viewModel, isDark = isDark)
 
         Spacer(Modifier.height(26.dp))
 
@@ -228,26 +194,7 @@ fun HomeScreen(
         Spacer(Modifier.height(26.dp))
 
         // ---- local AI status ---------------------------------------------------------------
-        GlassCard(isDark = isDark) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Eyebrow("Local AI")
-                EngineStatusPill(status)
-            }
-            Spacer(Modifier.height(12.dp))
-            GlassDivider(isDark = isDark)
-            Spacer(Modifier.height(6.dp))
-            StatRow("Model", modelInfo?.name ?: "Not loaded")
-            StatRow("Precision", modelInfo?.precision?.uppercase() ?: "—")
-            StatRow("Runtime", (status as? EngineStatus.Ready)?.accelerator ?: "CPU")
-            StatRow(
-                "Weights on disk",
-                modelInfo?.let { "%.1f MB".format(it.bytesOnDisk / 1_048_576.0) } ?: "—"
-            )
-        }
+        LocalAiCard(viewModel = viewModel, isDark = isDark)
 
         Spacer(Modifier.height(110.dp))
     }
@@ -263,6 +210,103 @@ fun EngineStatusPill(status: EngineStatus) {
         EngineStatus.Uninitialised -> "Standby" to Palette.Cyan
     }
     StatusPill(label = label, dotColor = color)
+}
+
+/**
+ * The status pill on the brand row. Reads the status itself so that a `Loading → Ready`
+ * transition invalidates this composable and not the whole Home screen.
+ */
+@Composable
+private fun HomeStatusPill(viewModel: PixelMindViewModel) {
+    val status by viewModel.engineStatus.collectAsState()
+    EngineStatusPill(status)
+}
+
+/**
+ * The Generate button and the only reader of [PixelMindViewModel.progress] on this screen.
+ * Progress changes once per diffusion step, so it is read as low in the tree as it can go.
+ */
+@Composable
+private fun HomeGenerateButton(
+    viewModel: PixelMindViewModel,
+    canGenerate: Boolean,
+    onOpenStudio: () -> Unit
+) {
+    val progress by viewModel.progress.collectAsState()
+    val busy = progress != null
+    GradientButton(
+        text = if (busy) "Generating on device…" else "Generate",
+        onClick = {
+            if (busy) onOpenStudio() else viewModel.generate()
+        },
+        modifier = Modifier.fillMaxWidth(),
+        enabled = canGenerate || busy,
+        icon = Icons.Filled.PlayArrow
+    )
+}
+
+/** The "weights not installed" card, which only appears for one engine status. */
+@Composable
+private fun MissingWeightsNotice(viewModel: PixelMindViewModel, isDark: Boolean) {
+    val status by viewModel.engineStatus.collectAsState()
+    AnimatedVisibility(visible = status is EngineStatus.WeightsMissing, enter = fadeIn(), exit = fadeOut()) {
+        Column {
+            Spacer(Modifier.height(14.dp))
+            GlassCard(isDark = isDark, tint = Palette.Amber, padding = PaddingValues(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.Info,
+                        contentDescription = null,
+                        tint = Palette.Amber,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text("Model weights not installed", style = MaterialTheme.typography.titleMedium)
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    (status as? EngineStatus.WeightsMissing)?.detail
+                        ?: "The bundled weights are missing from this build.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "PixelMind will not substitute stock images. Run tools/export_model.py and rebuild " +
+                        "to bundle the weights — see docs/MODEL.md.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+/** The "Local AI" card. Status and model info are read here, not by the screen body. */
+@Composable
+private fun LocalAiCard(viewModel: PixelMindViewModel, isDark: Boolean) {
+    val status by viewModel.engineStatus.collectAsState()
+    val modelInfo by viewModel.modelInfo.collectAsState()
+    GlassCard(isDark = isDark) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Eyebrow("Local AI")
+            EngineStatusPill(status)
+        }
+        Spacer(Modifier.height(12.dp))
+        GlassDivider(isDark = isDark)
+        Spacer(Modifier.height(6.dp))
+        StatRow("Model", modelInfo?.name ?: "Not loaded")
+        StatRow("Precision", modelInfo?.precision?.uppercase() ?: "—")
+        StatRow("Runtime", (status as? EngineStatus.Ready)?.accelerator ?: "CPU")
+        StatRow(
+            "Weights on disk",
+            modelInfo?.let { "%.1f MB".format(it.bytesOnDisk / 1_048_576.0) } ?: "—"
+        )
+    }
 }
 
 @Composable

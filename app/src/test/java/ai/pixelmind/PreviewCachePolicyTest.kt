@@ -60,6 +60,24 @@ class PreviewCachePolicyTest {
     }
 
     @Test
+    fun `a low-RAM device decodes a smaller edge than it asked for`() {
+        // A 480 px grid thumbnail is ~0.9 MB of ARGB_8888 and a 1080 px detail view ~4.5 MB; on a
+        // device that has declared itself low-RAM both were competing with the model's working
+        // set for the same memory.
+        assertEquals(480, PreviewCachePolicy.thumbnailEdge(480, isLowRam = false))
+        assertEquals(240, PreviewCachePolicy.thumbnailEdge(480, isLowRam = true))
+        assertEquals(1080, PreviewCachePolicy.thumbnailEdge(1080, isLowRam = false))
+        assertEquals(540, PreviewCachePolicy.thumbnailEdge(1080, isLowRam = true))
+    }
+
+    @Test
+    fun `halving never takes an edge below the usable floor`() {
+        assertEquals(PreviewCachePolicy.MIN_EDGE, PreviewCachePolicy.thumbnailEdge(0, isLowRam = true))
+        assertEquals(PreviewCachePolicy.MIN_EDGE, PreviewCachePolicy.thumbnailEdge(100, isLowRam = true))
+        assertTrue(PreviewCachePolicy.thumbnailEdge(1, isLowRam = true) >= PreviewCachePolicy.MIN_EDGE)
+    }
+
+    @Test
     fun `two sizes of the same file get different keys and share one prefix`() {
         val path = "/data/user/0/ai.pixelmind/files/generations/pm_1_2.png"
         val thumb = PreviewCachePolicy.key(path, 2)

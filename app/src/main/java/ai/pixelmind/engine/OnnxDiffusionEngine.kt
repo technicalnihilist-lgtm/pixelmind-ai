@@ -18,6 +18,7 @@ import java.io.File
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 import java.util.Random
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.CoroutineContext
 import kotlin.math.min
 
@@ -51,7 +52,14 @@ class OnnxDiffusionEngine(
     private var unet: OrtSession? = null
     private var vaeDecoder: OrtSession? = null
     private var manifest: ModelManifest? = null
-    private var tokenizer: ClipTokenizer? = null
+
+    /**
+     * The CLIP vocabulary, parsed on first use rather than here. See [TokenizerLoader]: the
+     * sessions are built at app start and again after every background transition, and parsing
+     * ~97,000 vocabulary entries at each of those points was startup work for a generation the
+     * user may never ask for.
+     */
+    private var tokenizerLoader: TokenizerLoader? = null
     private var accelerator: String = "CPU"
 
     private val scheduler = LcmScheduler()
@@ -67,6 +75,16 @@ class OnnxDiffusionEngine(
      */
     private val gate = Mutex()
     private val native = NativeScheduler
+
+    /**
+     * Set when sessions are built, cleared by the first generation.
+     *
+     * The warm-up exists so the first Generate does not absorb the delegates' lazy compilation.
+     * Running it at session creation meant paying it at app start — and again on every return
+     * from background — whether or not the user ever generated anything. It now runs inside the
+     * first pass instead, on exactly the three graphs that pass will use.
+     */
+    private val warmUpPending = AtomicBoolean(false)
 
     override fun status(): EngineStatus = currentStatus
 
@@ -153,9 +171,12 @@ class OnnxDiffusionEngine(
                 options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
                 configure(options)
 
-                encoder = runtimeEnv.createSession(File(dir, m.textEncoder.file).absolutePath, options)
-                unetSession = runtimeEnv.createSession(File(dir, m.unet.file).absolutePath, options)
-                vaeSession = runtimeEnv.createSession(File(dir, m.vaeDecoder.file).absolutePath, options)
+                // Timed per graph. Session creation is the dominant part of engine start-up and
+                // it is wildly uneven between graphs — the UNet is an order of magnitude slower to
+                // open than the decoder — so a single total would not say where the seconds went.
+                encoder = createTimed(runtimeEnv, File(dir, m.textEncoder.file), options)
+                unetSession = createTimed(runtimeEnv, File(dir, m.unet.file), options)
+                vaeSession = createTimed(runtimeEnv, File(dir, m.vaeDecoder.file), options)
 
                 textEncoder = encoder
                 unet = unetSession
@@ -180,13 +201,14 @@ class OnnxDiffusionEngine(
         }
         lastError?.let { throw it }
 
-        tokenizer = ClipTokenizer.fromFiles(
+        // Parsed by the first generation, not here: see TokenizerLoader.
+        tokenizerLoader = TokenizerLoader(
             vocab = File(dir, m.tokenizer.vocabFile),
             merges = File(dir, m.tokenizer.mergesFile),
             maxLength = m.tokenizer.maxLength
         )
-
-        warmUp(runtimeEnv, m)
+        // Same reasoning for the graphs: warmed by the first pass, not by opening the app.
+        warmUpPending.set(true)
 
         modelInfo = ModelInfo(
             name = m.name,
@@ -305,6 +327,14 @@ class OnnxDiffusionEngine(
 
         onProgress(GenerationProgress(GenerationStage.PREPARING, 0, fitted.steps, 0))
 
+        // The graphs are warmed by the first generation that needs them, not by opening the app.
+        // Only one pass can be here at a time (the caller holds the gate), and the flag is cleared
+        // whatever the outcome: a warm-up that failed leaves the real error to surface from the
+        // pass itself, exactly as it did when it ran at session creation.
+        if (warmUpPending.compareAndSet(true, false)) {
+            warmUp(sessions.env, m)
+        }
+
         // ---- 1-2. Text conditioning and the diffusion loop -------------------------------
         //
         // Both live in one call so the two text embeddings become unreachable the moment the
@@ -376,12 +406,14 @@ class OnnxDiffusionEngine(
         try {
             onProgress(GenerationProgress(GenerationStage.ENCODING_TEXT, 0, fitted.steps, elapsed(started)))
             val textStarted = SystemClock.elapsedRealtime()
+            // Parsed here, on the first generation, and reused by every later one.
+            val tokenizer = sessions.tokenizerLoader.get()
             val condEmbedding = runTextEncoder(
-                env, sessions.textEncoder, m, sessions.tokenizer, fitted.conditionalText()
+                env, sessions.textEncoder, m, tokenizer, fitted.conditionalText()
             )
             val uncondEmbedding = if (fitted.guidance > 1.05f) {
                 runTextEncoder(
-                    env, sessions.textEncoder, m, sessions.tokenizer, fitted.negativePrompt.trim()
+                    env, sessions.textEncoder, m, tokenizer, fitted.negativePrompt.trim()
                 )
             } else null
             val textDone = SystemClock.elapsedRealtime()
@@ -666,8 +698,9 @@ class OnnxDiffusionEngine(
         textEncoder = null
         vaeDecoder = null
         sessionOptions = null
-        tokenizer = null
+        tokenizerLoader = null
         manifest = null
+        warmUpPending.set(false)
     }
 
     /**
@@ -680,7 +713,7 @@ class OnnxDiffusionEngine(
     private fun loadedSessions(): LoadedSessions? {
         val e = env ?: return null
         val m = manifest ?: return null
-        val t = tokenizer ?: return null
+        val t = tokenizerLoader ?: return null
         val te = textEncoder ?: return null
         val u = unet ?: return null
         val v = vaeDecoder ?: return null
@@ -690,11 +723,29 @@ class OnnxDiffusionEngine(
     private data class LoadedSessions(
         val env: OrtEnvironment,
         val manifest: ModelManifest,
-        val tokenizer: ClipTokenizer,
+        val tokenizerLoader: TokenizerLoader,
         val textEncoder: OrtSession,
         val unet: OrtSession,
         val vaeDecoder: OrtSession
     )
+
+    /**
+     * Opens one graph and logs how long it took.
+     *
+     * The line is per graph on purpose: session creation is the biggest single cost of engine
+     * start-up and the three graphs are not comparable — a 600 MB UNet can take ten times what the
+     * decoder takes — so the total alone would not locate the cost.
+     */
+    private fun createTimed(
+        env: OrtEnvironment,
+        file: File,
+        options: OrtSession.SessionOptions
+    ): OrtSession {
+        val started = SystemClock.elapsedRealtime()
+        val session = env.createSession(file.absolutePath, options)
+        Log.i(TAG, "session created: ${file.name} in ${SystemClock.elapsedRealtime() - started} ms")
+        return session
+    }
 
     private fun FloatBuffer.copyOut(): FloatArray {
         val copy = FloatArray(remaining())

@@ -115,6 +115,28 @@ sample size, so a thumbnail and a full-size preview of the same file no longer e
 one another. None of this was exercised on a device: the cache is not unit-testable on the JVM
 (`android.util.LruCache` is a stub there), so the policy is tested and the wiring is inspection-only.
 
+### Cold start to first frame
+
+Instrumented, **not measured**. `MainActivity.logTimeToFirstFrame()` posts a `Choreographer` frame
+callback and logs
+
+    ColdStart: first frame <N>ms after process start
+
+where the origin is `Process.getStartUptimeMillis()` — the zygote fork, so the number covers class
+loading, `Application.onCreate`, activity creation and the first composition. It is a logcat line
+and nothing on screen reads it.
+
+There is no device or emulator in this environment, so no value is recorded here. What can be said
+without one is what moved *out* of the start-up path on Day 4:
+
+| Work | Before | After |
+| --- | --- | --- |
+| CLIP vocabulary parse (~49k entries + ~48k ranks) | every engine start: launch and every return from background | once, on the first generation |
+| Graph warm-up (text encoder + UNet + VAE) | every engine start | inside the first generation |
+| SHA-256 over the weight set | only when a component's (length, mtime) changed | unchanged |
+
+Anyone quoting a cold-start figure for this build would be inventing it.
+
 ### Still not measured
 
 Peak RSS for a real generation at any tier, and whether 20 cancelled generations leave the process
