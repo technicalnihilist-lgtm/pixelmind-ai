@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.4.0 — I/O and storage (Day 5 of the optimisation backlog)
+
+Maintenance release. No UI, feature, model-format or permission changes; the app still declares no
+platform permissions and no `INTERNET`. The one visible number that changes is the Settings
+"Total app data" row, which now counts what it claims to count.
+
+* **A rejected import no longer leaves its staging tree behind.** Both importers cleaned up in the
+  `catch` block only, and their early `return@withContext Result.Failed(...)` paths never reached
+  it — a model refused for a bad name, a duplicate entry or a checksum mismatch left its
+  half-unpacked tree in `filesDir`, hundreds of megabytes, until the next import happened to start
+  by deleting it. Cleanup now runs in a `finally` on every path, and also sweeps stray `.part`
+  files out of the installed tree.
+* **An import is refused before it starts when there is no room.** A model is unpacked into staging
+  while the model it replaces is kept for rollback, so it needs room for two. There was no check at
+  all: a full disk surfaced as the platform's `ENOSPC` text after minutes of copying. The import now
+  compares the selection's declared size (or the installed model's, when the provider declares
+  none) against the free space and says what is needed, what is free and how much to free up. A
+  mid-copy `ENOSPC` gets its own sentence too.
+* **Nothing is ever written straight into a visible filename.** When `renameTo` failed, both writers
+  fell back to `copyTo(target)` — a copy into the final path, which is exactly the truncated-file
+  hazard the staging file was added to prevent. They now go through `moveAtomically`, which asks for
+  an atomic move and fails loudly rather than copying.
+* **The generation write is one transaction.** The gallery row and the prompt-history row were two
+  commits, and a kill between them could leave a gallery entry whose prompt never reached the
+  history. They are now written together, in one journal commit.
+* **Prompt history is stable and idempotent.** `last_used` was `System.currentTimeMillis()`, so two
+  generations in the same millisecond produced two rows that compared equal and came back in
+  whatever order the storage engine felt like — the suggestion list reshuffled between reads. The
+  value is now strictly increasing per insert (and survives a clock set backwards), with `rowid` as
+  a tie-break, and a blank prompt is no longer stored as a history entry.
+* **The unused `favorite` index is gone.** No statement filters on `favorite` — the favourites
+  filter is applied to the loaded list in the gallery — and an index on a two-value column cannot
+  narrow a scan. It cost an index write on every insert and every favourite toggle. Schema v2 drops
+  it in place, without rebuilding the tables, so existing galleries are kept.
+* **Generated PNGs are 24-bit RGB, not 32-bit RGBA.** Every pixel of a generated image is opaque,
+  but the bitmap carried an alpha channel and the encoder wrote it, for a quarter more bytes per
+  file. The encoder is now told the image is opaque — decided by reading the pixels, so a bitmap
+  that really is transparent keeps its channel. Not measured on a device; it needs one to encode a
+  PNG.
+* **"Total app data" is the app's data.** The row added the images and the weights and called the
+  result a total, leaving out the database, its journal and the verification sidecar. It now shows
+  the size of the private directory. The arithmetic and the formatting behind all three rows are
+  pure functions with tests, so the card and the walk that feeds it cannot drift apart.
+* **The gallery SQL is tested against a real SQLite engine.** Android's `SQLiteDatabase` is a stub
+  on the unit-test classpath, so the statements moved into `GallerySql` and the tests execute that
+  exact text through `sqlite-jdbc` (test-only; nothing is added to the APK). The query plan, the
+  rollback and the upsert semantics are now verified rather than argued.
+
 ## 1.3.0 — startup and perceived performance (Day 4 of the optimisation backlog)
 
 Maintenance release. No UI, feature, model-format or permission changes; the app still declares no

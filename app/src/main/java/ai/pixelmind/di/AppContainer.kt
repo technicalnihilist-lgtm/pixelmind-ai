@@ -29,7 +29,7 @@ class AppContainer(context: Context) {
     val imageStore = ImageStore(appContext)
     val memoryGuard = MemoryGuard(appContext)
     val db = PixelMindDb(appContext)
-    val repository = PixelMindRepository(db, imageStore)
+    val repository = PixelMindRepository(db, imageStore, appContext.filesDir)
     val modelLocator = ModelLocator(appContext)
     val settingsStore = SettingsStore(appContext)
     val modelImporter = ModelImporter(appContext)

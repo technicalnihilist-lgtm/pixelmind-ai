@@ -35,22 +35,35 @@ class ModelImporter(private val context: Context) {
     private val previous: File get() = File(context.filesDir, "$MODELS_DIR.previous")
 
     suspend fun importZip(uri: Uri): Result = withContext(Dispatchers.IO) {
+        var installed = false
         try {
+            // Checked before anything is unpacked: a model tree is unpacked into staging while
+            // the model it replaces is still on disk for rollback, so an import needs room for
+            // roughly two models.
+            spaceCheck(declaredBytes(listOf(uri)))?.let { return@withContext Result.Failed(it) }
             freshStaging()
             val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
                 extractZip(input, staging)
             } ?: return@withContext Result.Failed("Could not open the selected file.")
             Log.i(TAG, "unpacked $bytes bytes into staging")
-            finishImport()
+            val result = finishImport()
+            installed = result is Result.Imported
+            result
         } catch (t: Throwable) {
             Log.e(TAG, "zip import failed", t)
-            staging.deleteRecursively()
-            Result.Failed(t.message ?: t.javaClass.simpleName)
+            Result.Failed(failureReason(t))
+        } finally {
+            // Every failure path leaves through here, including the `return@withContext` ones that
+            // used to skip the cleanup: a rejected import kept its half-unpacked tree — hundreds of
+            // megabytes of staging — until the next import happened to clear it.
+            if (!installed) discardStaging()
         }
     }
 
     suspend fun importFiles(uris: List<Uri>): Result = withContext(Dispatchers.IO) {
+        var installed = false
         try {
+            spaceCheck(declaredBytes(uris))?.let { return@withContext Result.Failed(it) }
             freshStaging()
             val seen = HashSet<String>()
             uris.forEach { uri ->
@@ -75,11 +88,14 @@ class ModelImporter(private val context: Context) {
                     }
                 } ?: return@withContext Result.Failed("Could not open $name.")
             }
-            finishImport()
+            val result = finishImport()
+            installed = result is Result.Imported
+            result
         } catch (t: Throwable) {
             Log.e(TAG, "file import failed", t)
-            staging.deleteRecursively()
-            Result.Failed(t.message ?: t.javaClass.simpleName)
+            Result.Failed(failureReason(t))
+        } finally {
+            if (!installed) discardStaging()
         }
     }
 
@@ -125,6 +141,79 @@ class ModelImporter(private val context: Context) {
     private fun freshStaging() {
         staging.deleteRecursively()
         staging.mkdirs()
+    }
+
+    /**
+     * Removes everything an abandoned import wrote.
+     *
+     * The staging tree is the bulk of it, but a `.part` file can also be left inside the installed
+     * tree if the swap was interrupted after `writeModelFile` staged a component, so both are swept.
+     */
+    private fun discardStaging() {
+        runCatching { staging.deleteRecursively() }
+        runCatching {
+            root.walkTopDown()
+                .onFail { _, _ -> }
+                .filter { it.isFile && it.name.endsWith(".part") }
+                .forEach { runCatching { it.delete() } }
+        }
+    }
+
+    /**
+     * Size the selection reports for itself, or a non-positive value when it reports none.
+     *
+     * `OpenableColumns.SIZE` is optional in the Storage Access Framework and several providers
+     * leave it null, which is why [ImportSpace] has an estimate for that case rather than treating
+     * an unknown size as zero.
+     */
+    private fun declaredBytes(uris: List<Uri>): Long {
+        var total = 0L
+        var known = false
+        uris.forEach { uri ->
+            val size = runCatching {
+                context.contentResolver
+                    .query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+                    ?.use { cursor ->
+                        if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else -1L
+                    } ?: -1L
+            }.getOrDefault(-1L)
+            if (size > 0) {
+                total += size
+                known = true
+            }
+        }
+        return if (known) total else -1L
+    }
+
+    /** Null when there is room for the import, otherwise the sentence to show instead. */
+    private fun spaceCheck(declared: Long): String? {
+        val free = runCatching { context.filesDir.usableSpace }.getOrDefault(Long.MAX_VALUE)
+        val installed = root.walkTopDown()
+            .onFail { _, _ -> }
+            .filter { it.isFile }
+            .sumOf { runCatching { it.length() }.getOrDefault(0L) }
+        return ImportSpace.shortfall(ImportSpace.requiredBytes(declared, installed), free)
+    }
+
+    /**
+     * The reason to show for a failed import.
+     *
+     * A full disk surfaces as an `IOException` whose message is the platform's own `ENOSPC` text,
+     * which says nothing about what the user can do. This is the one failure that the pre-flight
+     * check above cannot always catch — the provider may not declare a size, or something else may
+     * fill the disk mid-copy — so it gets a sentence of its own.
+     */
+    private fun failureReason(t: Throwable): String {
+        val message = t.message ?: t.javaClass.simpleName
+        val outOfSpace = message.contains("ENOSPC", ignoreCase = true) ||
+            message.contains("No space left", ignoreCase = true) ||
+            message.contains("not enough space", ignoreCase = true)
+        return if (outOfSpace) {
+            "Not enough free space on this device to unpack the model. Free up some space and " +
+                "import again — nothing was changed."
+        } else {
+            message
+        }
     }
 
     private fun extractZip(input: InputStream, destination: File): Long {
@@ -215,20 +304,6 @@ class ModelImporter(private val context: Context) {
         return Result.Imported(manifest.name, manifest.version, manifest.totalBytes)
     }
 
-    /** Copies at most [budget] bytes, so an oversized stream is refused instead of filling the disk. */
-    private fun copyLimited(input: InputStream, output: java.io.OutputStream, budget: Long): Long {
-        val buffer = ByteArray(BUFFER)
-        var written = 0L
-        while (true) {
-            val read = input.read(buffer)
-            if (read <= 0) break
-            written += read
-            if (written > budget) throw IllegalStateException("Archive is larger than 4 GB")
-            output.write(buffer, 0, read)
-        }
-        return written
-    }
-
     private fun invalidateVerification() {
         runCatching { File(context.filesDir, ModelLocator.VERIFIED_FILE).delete() }
     }
@@ -246,6 +321,26 @@ class ModelImporter(private val context: Context) {
         private const val MODELS_DIR = "models"
         private const val BUFFER = 1 shl 16
         private const val MAX_IMPORT_BYTES = 4L * 1024 * 1024 * 1024
+
+        /**
+         * Copies at most [budget] bytes, so an oversized stream is refused instead of filling the
+         * disk.
+         *
+         * It neither opens nor closes either stream: the caller owns both and wraps them in `use`,
+         * which is what keeps a failed import from holding a descriptor on the picked document.
+         */
+        internal fun copyLimited(input: InputStream, output: java.io.OutputStream, budget: Long): Long {
+            val buffer = ByteArray(BUFFER)
+            var written = 0L
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                written += read
+                if (written > budget) throw IllegalStateException("Archive is larger than 4 GB")
+                output.write(buffer, 0, read)
+            }
+            return written
+        }
 
         /**
          * Rejects absolute paths, parent traversal and empty names. Returns a path relative to the

@@ -1,6 +1,5 @@
 package ai.pixelmind.data
 
-import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
@@ -8,6 +7,9 @@ import android.database.sqlite.SQLiteOpenHelper
 /**
  * Plain SQLite. Deliberately not an ORM: the schema is four columns deep, and skipping
  * Room/KSP keeps both the APK and the build small.
+ *
+ * The statements themselves live in [GallerySql] so the JVM tests can run the exact same SQL
+ * against a real SQLite engine.
  */
 class PixelMindDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
 
@@ -39,84 +41,129 @@ class PixelMindDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERS
     }
 
     override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL(
-            """
-            CREATE TABLE $TABLE_GENERATIONS (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                negative_prompt TEXT NOT NULL DEFAULT '',
-                style TEXT NOT NULL,
-                aspect TEXT NOT NULL,
-                width INTEGER NOT NULL,
-                height INTEGER NOT NULL,
-                steps INTEGER NOT NULL,
-                seed INTEGER NOT NULL,
-                file_path TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                duration_ms INTEGER NOT NULL DEFAULT 0,
-                favorite INTEGER NOT NULL DEFAULT 0
-            )
-            """.trimIndent()
-        )
-        db.execSQL("CREATE INDEX idx_created ON $TABLE_GENERATIONS (created_at DESC)")
-        db.execSQL("CREATE INDEX idx_favorite ON $TABLE_GENERATIONS (favorite)")
-        db.execSQL(
-            """
-            CREATE TABLE $TABLE_PROMPTS (
-                prompt TEXT PRIMARY KEY,
-                last_used INTEGER NOT NULL,
-                uses INTEGER NOT NULL DEFAULT 1
-            )
-            """.trimIndent()
-        )
+        db.execSQL(GallerySql.CREATE_GENERATIONS)
+        db.execSQL(GallerySql.CREATE_INDEX_CREATED)
+        db.execSQL(GallerySql.CREATE_PROMPTS)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Local, disposable data: a schema change rebuilds rather than migrating history.
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_GENERATIONS")
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_PROMPTS")
-        onCreate(db)
+        // v1 -> v2 drops the unused `favorite` index and nothing else; the rows are kept.
+        // Earlier versions rebuilt the tables on any schema change, which was acceptable while
+        // the only change was to the shape of the data — this one is an index, and throwing the
+        // user's gallery away to remove it would be a worse bug than the one being fixed.
+        if (oldVersion < 2) db.execSQL(GallerySql.DROP_INDEX_FAVORITE)
     }
 
-    fun insertGeneration(record: GenerationRecord): Long {
-        val values = ContentValues().apply {
-            put("prompt", record.prompt)
-            put("negative_prompt", record.negativePrompt)
-            put("style", record.style)
-            put("aspect", record.aspect)
-            put("width", record.width)
-            put("height", record.height)
-            put("steps", record.steps)
-            put("seed", record.seed)
-            put("file_path", record.filePath)
-            put("created_at", record.createdAt)
-            put("duration_ms", record.durationMs)
-            put("favorite", if (record.favorite) 1 else 0)
-        }
-        return writableDatabase.insert(TABLE_GENERATIONS, null, values)
-    }
-
-    fun rememberPrompt(prompt: String) {
+    /**
+     * Runs [block] inside one transaction, so a group of statements commits or rolls back as a
+     * unit and costs one journal write instead of one per statement.
+     */
+    fun <T> transaction(block: (SQLiteDatabase) -> T): T {
         val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val result = block(db)
+            db.setTransactionSuccessful()
+            return result
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /**
+     * Writes the gallery row and the prompt-history row in a single transaction.
+     *
+     * They used to be two independent statements, each its own commit: two journal writes and two
+     * fsyncs per generation under WAL, and a window in which a kill could leave a gallery entry
+     * whose prompt never reached the history. Both rows are now one unit.
+     */
+    fun recordGeneration(record: GenerationRecord): Long = transaction { db ->
         db.execSQL(
-            "INSERT INTO $TABLE_PROMPTS (prompt, last_used, uses) VALUES (?, ?, 1) " +
-                "ON CONFLICT(prompt) DO UPDATE SET last_used = excluded.last_used, uses = uses + 1",
-            arrayOf(prompt.trim(), System.currentTimeMillis())
+            GallerySql.INSERT_GENERATION,
+            arrayOf(
+                record.prompt,
+                record.negativePrompt,
+                record.style,
+                record.aspect,
+                record.width,
+                record.height,
+                record.steps,
+                record.seed,
+                record.filePath,
+                record.createdAt,
+                record.durationMs,
+                if (record.favorite) 1 else 0
+            )
         )
+        rememberPrompt(db, record.prompt)
+        lastInsertedId(db)
+    }
+
+    /**
+     * Records that [prompt] was used, once per generation.
+     *
+     * A blank prompt is not a history entry; the upsert would otherwise put an empty row in the
+     * suggestion list.
+     */
+    fun rememberPrompt(prompt: String) {
+        rememberPrompt(writableDatabase, prompt)
+    }
+
+    private fun rememberPrompt(db: SQLiteDatabase, prompt: String) {
+        val key = prompt.trim()
+        if (key.isEmpty()) return
+        db.execSQL(GallerySql.REMEMBER_PROMPT, arrayOf(key, System.currentTimeMillis()))
+    }
+
+    fun setFavorite(id: Long, favorite: Boolean) {
+        writableDatabase.execSQL(GallerySql.TOGGLE_FAVORITE, arrayOf(if (favorite) 1 else 0, id))
+    }
+
+    fun deleteGeneration(id: Long) {
+        writableDatabase.execSQL(GallerySql.DELETE_GENERATION, arrayOf(id))
     }
 
     fun recentPrompts(limit: Int): List<String> =
-        readableDatabase.rawQuery(
-            "SELECT prompt FROM $TABLE_PROMPTS ORDER BY last_used DESC LIMIT $limit",
-            null
-        ).use { cursor ->
+        readableDatabase.rawQuery(GallerySql.RECENT_PROMPTS, arrayOf(limit.toString())).use { cursor ->
             buildList { while (cursor.moveToNext()) add(cursor.getString(0)) }
+        }
+
+    fun queryAll(): List<GenerationRecord> =
+        readableDatabase.rawQuery(GallerySql.SELECT_GENERATIONS, null).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(
+                        GenerationRecord(
+                            id = cursor.getLong(0),
+                            prompt = cursor.getString(1),
+                            negativePrompt = cursor.getString(2),
+                            style = cursor.getString(3),
+                            aspect = cursor.getString(4),
+                            width = cursor.getInt(5),
+                            height = cursor.getInt(6),
+                            steps = cursor.getInt(7),
+                            seed = cursor.getLong(8),
+                            filePath = cursor.getString(9),
+                            createdAt = cursor.getLong(10),
+                            durationMs = cursor.getLong(11),
+                            favorite = cursor.getInt(12) == 1
+                        )
+                    )
+                }
+            }
+        }
+
+    private fun lastInsertedId(db: SQLiteDatabase): Long =
+        db.rawQuery("SELECT last_insert_rowid()", null).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getLong(0) else -1L
         }
 
     companion object {
         private const val NAME = "pixelmind.db"
-        private const val VERSION = 1
-        const val TABLE_GENERATIONS = "generations"
-        const val TABLE_PROMPTS = "prompts"
+
+        /** v2: `idx_favorite` dropped (unused). See [GallerySql.CREATE_INDEX_CREATED]. */
+        private const val VERSION = 2
+        const val TABLE_GENERATIONS = GallerySql.TABLE_GENERATIONS
+        const val TABLE_PROMPTS = GallerySql.TABLE_PROMPTS
     }
 }

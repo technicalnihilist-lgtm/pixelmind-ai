@@ -269,6 +269,13 @@ class GenerationQueueTest {
         awaitTrue("the job to start running") {
             manager.jobs.value.singleOrNull()?.state == GenerationManager.JobState.RUNNING
         }
+        // RUNNING is published under the same lock as the worker handle, but the worker itself is
+        // started a moment later. Cancelling in that gap is legitimate — the lazy coroutine is
+        // cancelled before its body runs, so nothing is generated and the engine is never entered
+        // — and this test used to fail there, waiting 20 s for a cancellation the engine could not
+        // see because it had never been called. Wait for the worker to be inside the engine, which
+        // is the case this test is about.
+        awaitTrue("the worker to enter the engine") { engine.runs.get() == 1 }
 
         manager.cancelActive()
         awaitTrue("the worker to observe the cancellation") { engine.sawCancellation }

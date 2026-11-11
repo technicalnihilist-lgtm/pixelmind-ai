@@ -40,24 +40,53 @@ class ImageStore(private val context: Context) {
         // looked like a real image to every reader (totalBytes, count, a stale database row) but
         // decoded to nothing. Only the rename makes it visible, and a rename is atomic.
         val staging = File(root, "${file.name}.part")
+        val hadAlpha = bitmap.hasAlpha()
         try {
+            // A generated image is opaque in every pixel, but the bitmap still has an alpha
+            // channel and the encoder therefore wrote 32-bit RGBA: a quarter more bytes on disk
+            // for a channel that is 0xFF everywhere. Declaring the bitmap opaque is lossless —
+            // the pixels are unchanged, only the PNG's colour type goes from RGBA to RGB — and it
+            // is decided by reading the pixels, so a bitmap that really is transparent keeps its
+            // channel. PNG ignores the quality argument, so this is the only size lever it has.
+            if (hadAlpha) {
+                runCatching { if (isFullyOpaque(bitmap)) bitmap.setHasAlpha(false) }
+            }
             FileOutputStream(staging).use { out ->
                 if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
                     throw java.io.IOException("the image could not be encoded as PNG")
                 }
                 out.flush()
             }
-            if (!staging.renameTo(file)) {
-                // Some filesystems refuse a rename onto a fresh path; the copy is still staged.
-                staging.copyTo(file, overwrite = true)
-                staging.delete()
-            }
+            // A rename, never a copy: the fallback copy this replaced wrote straight into the
+            // visible name and could leave a truncated PNG if the process died mid-copy.
+            moveAtomically(staging, file)
         } catch (t: Throwable) {
             runCatching { staging.delete() }
             throw t
+        } finally {
+            if (hadAlpha) runCatching { bitmap.setHasAlpha(true) }
         }
         sweepStaging()
         return file
+    }
+
+    /**
+     * True when every pixel of [bitmap] is fully opaque.
+     *
+     * Scanned a row at a time into a reused buffer rather than as one `getPixels` call, because a
+     * whole 1024×1024 image is 4 MB of temporary array and this runs while the model's working set
+     * is still live.
+     */
+    private fun isFullyOpaque(bitmap: Bitmap): Boolean {
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= 0 || height <= 0) return true
+        val row = IntArray(width)
+        for (y in 0 until height) {
+            bitmap.getPixels(row, 0, width, 0, y, width, 1)
+            if (!Opacity.isOpaque(row, width)) return false
+        }
+        return true
     }
 
     /**

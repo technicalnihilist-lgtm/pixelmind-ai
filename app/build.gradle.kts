@@ -12,8 +12,8 @@ android {
         applicationId = "ai.pixelmind"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "1.3.0"
+        versionCode = 11
+        versionName = "1.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -97,6 +97,9 @@ dependencies {
     // for tests that build or parse a model manifest.
     testImplementation("org.json:json:20240303")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    // The gallery's SQL is verified against a real SQLite engine, because Android's SQLiteDatabase
+    // is a stub on the unit-test classpath. Test-only: nothing is added to the APK.
+    testImplementation("org.xerial:sqlite-jdbc:3.46.1.3")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.1")

@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import ai.pixelmind.BuildConfig
 import ai.pixelmind.engine.EngineStatus
 import ai.pixelmind.ui.ImportUiState
+import ai.pixelmind.util.StorageUsage
 import ai.pixelmind.ui.PixelMindViewModel
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -41,6 +42,7 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
     val modelInfo by viewModel.modelInfo.collectAsState()
     val hardware by viewModel.hardware.collectAsState()
     val storage by viewModel.storageBytes.collectAsState()
+    val appDataBytes by viewModel.appDataBytes.collectAsState()
     val importState by viewModel.importState.collectAsState()
 
     // Storage Access Framework: the user grants access to individual documents, so the app still
@@ -84,7 +86,7 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
             StatRow("Max resolution", modelInfo?.let { "${it.maxResolution}px" } ?: "—")
             StatRow(
                 "Weights on disk",
-                if (modelBytes > 0) formatBytes(modelBytes) else "not provisioned"
+                if (modelBytes > 0) StorageUsage.formatBytes(modelBytes) else "not provisioned"
             )
             Spacer(Modifier.height(10.dp))
             GlassDivider(isDark = isDark)
@@ -202,9 +204,14 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
         GlassCard(isDark = isDark) {
             Eyebrow("Storage")
             Spacer(Modifier.height(12.dp))
-            StatRow("Generated images", formatBytes(storage))
-            StatRow("Model weights", if (modelBytes > 0) formatBytes(modelBytes) else "—")
-            StatRow("Total app data", formatBytes(storage + modelBytes))
+            StatRow("Generated images", StorageUsage.formatBytes(storage))
+            StatRow(
+                "Model weights",
+                if (modelBytes > 0) StorageUsage.formatBytes(modelBytes) else "—"
+            )
+            // The whole private directory, not images + weights: the database, its journal and the
+            // verification sidecar are app data too, and the row says "total".
+            StatRow("Total app data", StorageUsage.formatBytes(appDataBytes))
             Spacer(Modifier.height(8.dp))
             Text(
                 "Images live in app-private storage and are removed when the app is uninstalled. " +
@@ -286,9 +293,3 @@ private fun modelType(name: String?): String = when {
     else -> "Production"
 }
 
-private fun formatBytes(bytes: Long): String = when {
-    bytes >= 1_073_741_824 -> "%.2f GB".format(bytes / 1_073_741_824.0)
-    bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
-    bytes >= 1024 -> "%.0f KB".format(bytes / 1024.0)
-    else -> "$bytes B"
-}

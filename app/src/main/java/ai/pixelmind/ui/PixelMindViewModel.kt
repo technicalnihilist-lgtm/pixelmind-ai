@@ -94,6 +94,10 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
     private val _modelBytes = MutableStateFlow(0L)
     val modelBytes: StateFlow<Long> = _modelBytes.asStateFlow()
 
+    /** Everything in app-private storage: images, weights, database and sidecars. */
+    private val _appDataBytes = MutableStateFlow(0L)
+    val appDataBytes: StateFlow<Long> = _appDataBytes.asStateFlow()
+
     init {
         refreshStorage()
         loadHardware()
@@ -283,6 +287,7 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             _storageBytes.value = withContext(Dispatchers.IO) { repository.storageBytes() }
             _modelBytes.value = withContext(Dispatchers.IO) { container.modelLocator.storageBytes() }
+            _appDataBytes.value = withContext(Dispatchers.IO) { repository.appDataBytes() }
         }
     }
 

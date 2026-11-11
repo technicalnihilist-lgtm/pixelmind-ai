@@ -2,6 +2,7 @@ package ai.pixelmind.engine
 
 import android.content.Context
 import android.util.Log
+import ai.pixelmind.util.moveAtomically
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
@@ -242,10 +243,9 @@ internal fun writeModelFile(modelDir: File, relativePath: String, input: java.io
         if (target.exists() && !target.delete()) {
             throw IllegalStateException("could not replace $relativePath")
         }
-        if (!staging.renameTo(target)) {
-            staging.copyTo(target, overwrite = true)
-            staging.delete()
-        }
+        // Renamed, never copied: the copy fallback that used to be here wrote into the visible
+        // path and could leave a truncated graph if the process died partway through it.
+        moveAtomically(staging, target)
     } catch (t: Throwable) {
         // A failed copy used to leave its ".part" behind in filesDir forever.
         runCatching { staging.delete() }

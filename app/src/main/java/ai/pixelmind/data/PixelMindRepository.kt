@@ -3,16 +3,19 @@ package ai.pixelmind.data
 import ai.pixelmind.engine.GenerationRequest
 import ai.pixelmind.engine.GeneratedImage
 import ai.pixelmind.util.ImageStore
+import ai.pixelmind.util.StorageUsage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /** Single source of truth for gallery content, favourites and prompt history. */
 class PixelMindRepository(
     private val db: PixelMindDb,
-    private val imageStore: ImageStore
+    private val imageStore: ImageStore,
+    private val appDataDir: File
 ) : GenerationRecorder {
     private val _generations = MutableStateFlow<List<GenerationRecord>>(emptyList())
     val generations: StateFlow<List<GenerationRecord>> = _generations.asStateFlow()
@@ -21,12 +24,13 @@ class PixelMindRepository(
     val promptHistory: StateFlow<List<String>> = _promptHistory.asStateFlow()
 
     suspend fun refresh() = withContext(Dispatchers.IO) {
-        _generations.value = queryAll()
-        _promptHistory.value = db.recentPrompts(30)
+        publish()
     }
 
     override suspend fun record(request: GenerationRequest, image: GeneratedImage) = withContext(Dispatchers.IO) {
-        db.insertGeneration(
+        // One transaction, one commit: the gallery row and the prompt-history row are written
+        // together or not at all.
+        db.recordGeneration(
             GenerationRecord(
                 id = 0,
                 prompt = request.prompt.trim(),
@@ -43,56 +47,39 @@ class PixelMindRepository(
                 favorite = false
             )
         )
-        db.rememberPrompt(request.prompt)
-        _generations.value = queryAll()
-        _promptHistory.value = db.recentPrompts(30)
+        publish()
     }
 
     suspend fun toggleFavorite(record: GenerationRecord) = withContext(Dispatchers.IO) {
-        db.writableDatabase.execSQL(
-            "UPDATE ${PixelMindDb.TABLE_GENERATIONS} SET favorite = ? WHERE id = ?",
-            arrayOf(if (record.favorite) 0 else 1, record.id)
-        )
-        _generations.value = queryAll()
+        db.setFavorite(record.id, !record.favorite)
+        publish()
     }
 
     suspend fun delete(record: GenerationRecord) = withContext(Dispatchers.IO) {
         imageStore.delete(record.filePath)
-        db.writableDatabase.delete(
-            PixelMindDb.TABLE_GENERATIONS, "id = ?", arrayOf(record.id.toString())
-        )
-        _generations.value = queryAll()
+        db.deleteGeneration(record.id)
+        publish()
     }
 
     fun storageBytes(): Long = imageStore.totalBytes()
 
-    private fun queryAll(): List<GenerationRecord> =
-        db.readableDatabase.rawQuery(
-            "SELECT id, prompt, negative_prompt, style, aspect, width, height, steps, seed, " +
-                "file_path, created_at, duration_ms, favorite " +
-                "FROM ${PixelMindDb.TABLE_GENERATIONS} ORDER BY created_at DESC",
-            null
-        ).use { cursor ->
-            buildList {
-                while (cursor.moveToNext()) {
-                    add(
-                        GenerationRecord(
-                            id = cursor.getLong(0),
-                            prompt = cursor.getString(1),
-                            negativePrompt = cursor.getString(2),
-                            style = cursor.getString(3),
-                            aspect = cursor.getString(4),
-                            width = cursor.getInt(5),
-                            height = cursor.getInt(6),
-                            steps = cursor.getInt(7),
-                            seed = cursor.getLong(8),
-                            filePath = cursor.getString(9),
-                            createdAt = cursor.getLong(10),
-                            durationMs = cursor.getLong(11),
-                            favorite = cursor.getInt(12) == 1
-                        )
-                    )
-                }
-            }
-        }
+    /**
+     * Everything the app keeps in its own private directory: the generated PNGs, the provisioned
+     * weights, the database and its journal, the verification sidecar and any import staging left
+     * mid-flight.
+     *
+     * This is what the Settings card's "Total app data" row shows. That row used to add the images
+     * and the weights together and call the result "total app data", which understated it by
+     * everything else in the directory — small next to 1.2 GB of weights, but not true.
+     */
+    fun appDataBytes(): Long = StorageUsage.treeBytes(appDataDir)
+
+    private fun publish() {
+        _generations.value = db.queryAll()
+        _promptHistory.value = db.recentPrompts(PROMPT_HISTORY_LIMIT)
+    }
+
+    companion object {
+        private const val PROMPT_HISTORY_LIMIT = 30
+    }
 }
