@@ -30,6 +30,15 @@ class ModelImporter(private val context: Context) {
         data class Failed(val reason: String) : Result
     }
 
+    /**
+     * A read failure on one file of the selection.
+     *
+     * An import is a loop over documents, and the loop used to report the last exception verbatim:
+     * "open failed: EACCES" with no indication of which of the five picked files it was. The name
+     * is the only thing that makes the message actionable.
+     */
+    internal class ImportFileFailure(val file: String, cause: Throwable) : Exception(cause)
+
     private val root: File get() = File(context.filesDir, MODELS_DIR)
     private val staging: File get() = File(context.filesDir, "$MODELS_DIR.staging")
     private val previous: File get() = File(context.filesDir, "$MODELS_DIR.previous")
@@ -82,11 +91,18 @@ class ModelImporter(private val context: Context) {
                 }
                 val target = File(staging, safe)
                 target.parentFile?.mkdirs()
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    target.outputStream().use { output ->
-                        copyLimited(input, output, MAX_IMPORT_BYTES)
-                    }
-                } ?: return@withContext Result.Failed("Could not open $name.")
+                try {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        target.outputStream().use { output ->
+                            copyLimited(input, output, MAX_IMPORT_BYTES)
+                        }
+                    } ?: return@withContext Result.Failed(
+                        "Could not open $name: the file manager would not return its contents."
+                    )
+                } catch (t: Throwable) {
+                    // Attributed to the file it happened on, not to "the import".
+                    throw ImportFileFailure(name, t)
+                }
             }
             val result = finishImport()
             installed = result is Result.Imported
@@ -203,18 +219,7 @@ class ModelImporter(private val context: Context) {
      * check above cannot always catch — the provider may not declare a size, or something else may
      * fill the disk mid-copy — so it gets a sentence of its own.
      */
-    private fun failureReason(t: Throwable): String {
-        val message = t.message ?: t.javaClass.simpleName
-        val outOfSpace = message.contains("ENOSPC", ignoreCase = true) ||
-            message.contains("No space left", ignoreCase = true) ||
-            message.contains("not enough space", ignoreCase = true)
-        return if (outOfSpace) {
-            "Not enough free space on this device to unpack the model. Free up some space and " +
-                "import again — nothing was changed."
-        } else {
-            message
-        }
-    }
+    private fun failureReason(t: Throwable): String = describeImportFailure(t)
 
     private fun extractZip(input: InputStream, destination: File): Long {
         var total = 0L
@@ -242,8 +247,12 @@ class ModelImporter(private val context: Context) {
                 // The cap is enforced while copying, not after: a single zip entry can decompress
                 // to far more than the limit, and the old check only ran once the whole entry had
                 // already been written to the device.
-                target.outputStream().use { output ->
-                    total += copyLimited(zip, output, MAX_IMPORT_BYTES - total)
+                try {
+                    target.outputStream().use { output ->
+                        total += copyLimited(zip, output, MAX_IMPORT_BYTES - total)
+                    }
+                } catch (t: Throwable) {
+                    throw ImportFileFailure(entry.name, t)
                 }
                 zip.closeEntry()
             }
@@ -259,7 +268,9 @@ class ModelImporter(private val context: Context) {
         val manifestFile = files.firstOrNull { it.name == ModelManifest.FILE_NAME }
         val manifest: ModelManifest = if (manifestFile != null) {
             runCatching { ModelManifest.parse(manifestFile.readText()) }.getOrElse {
-                return Result.Failed("model_manifest.json is unreadable: ${it.message}")
+                return Result.Failed(
+                    "The model_manifest.json in this import could not be read. ${describeFailure(it)}"
+                )
             }
         } else {
             val detected = detectComponents(files.map { it.relativeTo(staging).path })
@@ -318,6 +329,36 @@ class ModelImporter(private val context: Context) {
 
     companion object {
         private const val TAG = "ModelImporter"
+
+        private const val OUT_OF_SPACE_SENTENCE =
+            "Not enough free space on this device to unpack the model. Free up some space and " +
+                "import again — nothing was changed."
+
+        /**
+         * One sentence for a failed import, mapped rather than copied from the exception, and
+         * naming the file when the failure belongs to one.
+         *
+         * The free-space case is checked across the cause chain because the platform wraps
+         * `ENOSPC` inside an `IOException` whose own message says nothing about space; everything
+         * else goes through [describeFailure], which also keeps absolute paths off the screen.
+         */
+        internal fun describeImportFailure(t: Throwable): String {
+            val named = t as? ImportFileFailure
+            val cause = if (named != null) (named.cause ?: named) else t
+            val reason = if (isOutOfSpace(cause)) OUT_OF_SPACE_SENTENCE else describeFailure(cause)
+            // The file name comes from the selection, so it is the user's own — never an
+            // absolute path the app chose.
+            return if (named == null) reason else "Could not read ${named.file} from the selection. $reason"
+        }
+
+        internal fun isOutOfSpace(t: Throwable): Boolean =
+            generateSequence(t) { it.cause }.take(5).any { e ->
+                val message = e.message ?: return@any false
+                message.contains("ENOSPC", ignoreCase = true) ||
+                    message.contains("No space left", ignoreCase = true) ||
+                    message.contains("not enough space", ignoreCase = true)
+            }
+
         private const val MODELS_DIR = "models"
         private const val BUFFER = 1 shl 16
         private const val MAX_IMPORT_BYTES = 4L * 1024 * 1024 * 1024
