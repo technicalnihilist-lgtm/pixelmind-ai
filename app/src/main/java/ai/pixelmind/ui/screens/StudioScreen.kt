@@ -289,14 +289,19 @@ fun StudioScreen(viewModel: PixelMindViewModel) {
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Spacer(Modifier.height(14.dp))
-                    GlassButton(
-                        text = "Retry",
-                        onClick = viewModel::retryLast,
-                        modifier = Modifier.fillMaxWidth(),
-                        isDark = isDark,
-                        icon = Icons.Filled.Refresh
-                    )
+                    // Offered only when a second attempt can actually succeed. A job that failed
+                    // because no weights are installed fails identically on retry, so the button
+                    // was a promise the app could not keep.
+                    if (failedJob?.retryable == true) {
+                        Spacer(Modifier.height(14.dp))
+                        GlassButton(
+                            text = "Retry",
+                            onClick = viewModel::retryLast,
+                            modifier = Modifier.fillMaxWidth(),
+                            isDark = isDark,
+                            icon = Icons.Filled.Refresh
+                        )
+                    }
                 }
             }
         }
