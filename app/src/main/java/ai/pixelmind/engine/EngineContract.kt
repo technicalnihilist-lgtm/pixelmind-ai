@@ -79,6 +79,26 @@ sealed interface EngineStatus {
     val isReady: Boolean get() = this is Ready
 }
 
+/** The graphs a failure can be attributed to, so a message can say which one broke. */
+internal enum class GraphName(val label: String) {
+    TEXT_ENCODER("text encoder"),
+    UNET("UNet"),
+    VAE_DECODER("VAE decoder")
+}
+
+/**
+ * A failure that belongs to one graph.
+ *
+ * ONNX Runtime reports a bad session, a rejected input shape and an unsupported operator with the
+ * same kind of native string, so the old failure card said "generation failed" without saying
+ * where. Wrapping at the call site is the only place that knows which graph was running.
+ */
+internal class GraphFailure(
+    val graph: GraphName,
+    val reason: String,
+    cause: Throwable? = null
+) : Exception(reason, cause)
+
 /**
  * Turns a thrown failure into one sentence a user can act on.
  *
@@ -86,16 +106,46 @@ sealed interface EngineStatus {
  * is null on ART — reached the failure card as the bare word "OutOfMemoryError", and an
  * allocation failure deep inside ONNX Runtime reached it as whatever native string happened to be
  * in flight. The mapping is deliberately small: it only claims things that are true.
+ *
+ * Two properties are load-bearing and tested: no branch can leak a filesystem path (a native
+ * message routinely carries one, and the UI has no business showing `/data/user/0/...`), and an
+ * out-of-memory failure names the setting to change rather than just saying "memory".
  */
 internal fun describeFailure(t: Throwable): String = when (t) {
-    is OutOfMemoryError ->
-        "The device ran out of memory while running the model. Close other apps and try again."
+    is GraphFailure -> "The ${t.graph.label} failed: ${redactPaths(t.reason)}"
+    is OutOfMemoryError -> OUT_OF_MEMORY_SENTENCE
     is SecurityException ->
         "The app is not allowed to read the model files. Reinstall the app to restore them."
     is java.io.FileNotFoundException ->
         "A model file could not be opened. It may have been removed; reimport the model."
-    else -> t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
+    is org.json.JSONException ->
+        "A model file is not valid JSON, so it could not be read. Reimport the model."
+    is java.io.IOException ->
+        "A file could not be read or written. Check that this device has free space and try again."
+    else -> redactPaths(t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName)
 }
+
+/**
+ * The out-of-memory sentence, with the setting that actually reduces the working set.
+ *
+ * "Fast" is not a guess: [QualityTier.FAST] runs 4 steps at a 0.75 resolution scale, which is the
+ * smallest configuration the pipeline supports, so it is the one thing the user can change that
+ * makes the next attempt cheaper.
+ */
+internal const val OUT_OF_MEMORY_SENTENCE =
+    "This device ran out of memory while running the model. Close other apps, choose the Fast " +
+        "quality setting, and try again."
+
+/**
+ * Removes filesystem paths from a message.
+ *
+ * Any absolute path with at least two segments is replaced. A single-segment token like "/8" or a
+ * fraction is left alone, so ordinary sentences survive untouched.
+ */
+internal fun redactPaths(text: String): String =
+    ABSOLUTE_PATH.replace(text, "<file>")
+
+private val ABSOLUTE_PATH = Regex("""(?:file://)?(?:/[A-Za-z0-9._\-]+){2,}/?""")
 
 /**
  * The only surface the rest of the app is allowed to touch. Everything about ONNX Runtime,
