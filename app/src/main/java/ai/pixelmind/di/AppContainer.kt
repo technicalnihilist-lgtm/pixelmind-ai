@@ -22,7 +22,8 @@ import kotlinx.coroutines.launch
  */
 class AppContainer(context: Context) {
 
-    private val appContext = context.applicationContext
+    /** Exposed so the ViewModel can reach the clipboard for the debug diagnostics dump. */
+    val appContext = context.applicationContext
 
     val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
