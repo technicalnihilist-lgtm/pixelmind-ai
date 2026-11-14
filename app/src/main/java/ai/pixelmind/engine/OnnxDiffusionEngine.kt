@@ -109,6 +109,12 @@ class OnnxDiffusionEngine(
                 is ModelLocator.Resolution.Corrupt -> {
                     currentStatus = EngineStatus.Failed(resolution.detail)
                 }
+                // Also a Failed state, but with its own sentence: nothing is truncated and nothing
+                // has to be re-imported, so telling the user the weights are damaged would be
+                // false. The pill reads "Engine error" for both, the detail tells them apart.
+                is ModelLocator.Resolution.Unreadable -> {
+                    currentStatus = EngineStatus.Failed(resolution.detail)
+                }
                 is ModelLocator.Resolution.Available -> {
                     val located = resolution.located
                     manifest = located.manifest
@@ -174,9 +180,11 @@ class OnnxDiffusionEngine(
                 // Timed per graph. Session creation is the dominant part of engine start-up and
                 // it is wildly uneven between graphs — the UNet is an order of magnitude slower to
                 // open than the decoder — so a single total would not say where the seconds went.
-                encoder = createTimed(runtimeEnv, File(dir, m.textEncoder.file), options)
-                unetSession = createTimed(runtimeEnv, File(dir, m.unet.file), options)
-                vaeSession = createTimed(runtimeEnv, File(dir, m.vaeDecoder.file), options)
+                // Each graph is named as it opens, so a session that fails to build reports
+                // *which* graph failed instead of "the engine could not start".
+                encoder = createTimed(runtimeEnv, File(dir, m.textEncoder.file), options, GraphName.TEXT_ENCODER)
+                unetSession = createTimed(runtimeEnv, File(dir, m.unet.file), options, GraphName.UNET)
+                vaeSession = createTimed(runtimeEnv, File(dir, m.vaeDecoder.file), options, GraphName.VAE_DECODER)
 
                 textEncoder = encoder
                 unet = unetSession
@@ -220,7 +228,13 @@ class OnnxDiffusionEngine(
             stepsRecommended = 4,
             maxResolution = 640
         )
-        Log.i(TAG, "Sessions ready ($accelerator) for ${m.name} ${m.version}")
+        // Once per session, not once per generation: the accelerator is chosen while the sessions
+        // are built and never changes afterwards, and a line per generation would bury it.
+        Log.i(
+            TAG,
+            "Sessions ready for ${m.name} ${m.version}: accelerator=$accelerator, " +
+                "intra-op=${min(4, cores)} threads, inter-op=1, ${cores} cores"
+        )
     }
 
     override suspend fun generate(
@@ -233,7 +247,8 @@ class OnnxDiffusionEngine(
         val weightsMb = (manifest?.totalBytes ?: 0L) / 1_048_576.0
         val fitted = memoryGuard.fitToDevice(request, weightsMb)
             ?: return@withContext GenerationResult.Failed(
-                "This device does not have enough free memory to run the model safely."
+                "This device does not have enough free memory to run the model safely. Close " +
+                    "other apps, choose the Fast quality setting, and try again."
             )
         if (fitted != request) {
             Log.i(TAG, "Request scaled to ${fitted.width}x${fitted.height} @ ${fitted.steps} steps")
@@ -536,13 +551,13 @@ class OnnxDiffusionEngine(
         m: ModelManifest,
         tokenizer: ClipTokenizer,
         text: String
-    ): FloatArray {
+    ): FloatArray = inGraph(GraphName.TEXT_ENCODER) {
         val ids = tokenizer.encode(text)
         OnnxTensor.createTensor(env, LongBuffer.wrap(ids), longArrayOf(1, ids.size.toLong())).use { tensor ->
             session.run(mapOf(m.textEncoder.inputNames[0] to tensor)).use { result ->
                 val out = result.get(m.textEncoder.outputName)
                     .orElseThrow { IllegalStateException("Text encoder produced no output") } as OnnxTensor
-                return out.floatBuffer.copyOut()
+                out.floatBuffer.copyOut()
             }
         }
     }
@@ -558,7 +573,7 @@ class OnnxDiffusionEngine(
         latentW: Int,
         embedding: FloatArray,
         dest: FloatArray
-    ) {
+    ) = inGraph(GraphName.UNET) {
         require(scaled.size == latent.size) { "scratch buffer must match the latent size" }
         require(dest.size == latent.size) { "output buffer must match the latent size" }
         for (i in latent.indices) scaled[i] = latent[i] * LcmScheduler.LATENT_SCALE
@@ -634,7 +649,7 @@ class OnnxDiffusionEngine(
         width: Int,
         height: Int,
         jobContext: CoroutineContext
-    ): Bitmap {
+    ): Bitmap = inGraph(GraphName.VAE_DECODER) {
         val latent = buffers.latent
         val unscaled = buffers.decodeScratch
         for (i in latent.indices) unscaled[i] = latent[i] / LcmScheduler.LATENT_SCALE
@@ -674,7 +689,7 @@ class OnnxDiffusionEngine(
                 }
             }
         }
-        return Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888)
+        Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888)
     }
 
     private fun toByte(value: Float): Int {
@@ -739,12 +754,32 @@ class OnnxDiffusionEngine(
     private fun createTimed(
         env: OrtEnvironment,
         file: File,
-        options: OrtSession.SessionOptions
+        options: OrtSession.SessionOptions,
+        graph: GraphName
     ): OrtSession {
         val started = SystemClock.elapsedRealtime()
-        val session = env.createSession(file.absolutePath, options)
+        val session = inGraph(graph) { env.createSession(file.absolutePath, options) }
         Log.i(TAG, "session created: ${file.name} in ${SystemClock.elapsedRealtime() - started} ms")
         return session
+    }
+
+    /**
+     * Runs [block] and attributes any failure to [graph].
+     *
+     * Cancellation and an out-of-memory error pass through unwrapped: the first is not a failure,
+     * and the second already has a sentence that names the setting to change — burying it inside
+     * "The UNet failed:" would make it harder to act on, not easier.
+     */
+    private inline fun <T> inGraph(graph: GraphName, block: () -> T): T = try {
+        block()
+    } catch (c: CancellationException) {
+        throw c
+    } catch (o: OutOfMemoryError) {
+        throw o
+    } catch (f: GraphFailure) {
+        throw f
+    } catch (t: Throwable) {
+        throw GraphFailure(graph, describeFailure(t), t)
     }
 
     private fun FloatBuffer.copyOut(): FloatArray {
