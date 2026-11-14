@@ -273,6 +273,17 @@ fun SettingsScreen(viewModel: PixelMindViewModel) {
             Spacer(Modifier.height(12.dp))
             StatRow("App version", BuildConfig.VERSION_NAME)
             StatRow("Build", BuildConfig.BUILD_TYPE)
+            // Debug builds only: the release UI is unchanged, and there is no reason to hand a
+            // shipped app a button that exists for bug reports.
+            if (BuildConfig.DEBUG) {
+                Spacer(Modifier.height(10.dp))
+                GlassButton(
+                    text = "Copy diagnostics",
+                    onClick = viewModel::copyDiagnostics,
+                    isDark = isDark,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
             Spacer(Modifier.height(8.dp))
             Text(
                 "Generated images are produced by a distilled diffusion model running entirely on " +
