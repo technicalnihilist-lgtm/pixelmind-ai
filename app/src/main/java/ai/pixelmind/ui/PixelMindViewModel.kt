@@ -15,6 +15,10 @@ import ai.pixelmind.engine.RunTimings
 import ai.pixelmind.engine.StylePreset
 import ai.pixelmind.manager.GenerationManager
 import ai.pixelmind.ui.theme.ThemeMode
+import ai.pixelmind.BuildConfig
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -109,7 +113,11 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
                         _lastTimings.value = result.timings
                     }
                     is GenerationResult.Failed -> _message.value = result.reason
-                    GenerationResult.Cancelled -> _message.value = "Generation cancelled."
+                    // No snackbar for a cancellation. The user pressed Cancel, or the app went to
+                    // the background: the progress card is already gone and the Studio screen
+                    // already shows the idle state, so a toast here was a second, redundant
+                    // notification of something the user had just asked for.
+                    GenerationResult.Cancelled -> Unit
                 }
                 refreshStorage()
             }
@@ -175,8 +183,16 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
 
     fun cancel() = manager.cancelActive()
 
+    /**
+     * Re-runs the most recent failure that a retry can actually fix.
+     *
+     * The failure card only shows Retry for a retryable job, but the action is guarded here too:
+     * a failure caused by missing weights would fail identically on the second attempt.
+     */
     fun retryLast() {
-        val last = manager.jobs.value.lastOrNull { it.state == GenerationManager.JobState.FAILED }
+        val last = manager.jobs.value.lastOrNull {
+            it.state == GenerationManager.JobState.FAILED && it.retryable
+        }
         if (last != null) manager.retry(last.id) else generate()
     }
 
@@ -279,6 +295,59 @@ class PixelMindViewModel(private val container: AppContainer) : ViewModel() {
         EngineStatus.Loading -> "still loading"
         is EngineStatus.Ready -> "ready"
         EngineStatus.Uninitialised -> "not initialised"
+    }
+
+    // ---- diagnostics ----------------------------------------------------------------------
+
+    /**
+     * Copies a diagnostics dump to the clipboard. Debug builds only.
+     *
+     * Release builds return before doing anything, so the shipped app gains no surface: this is
+     * for a bug report, and every figure in it is read from state the app already holds — nothing
+     * is measured here, so nothing can be misreported as a device measurement.
+     */
+    fun copyDiagnostics() {
+        if (!BuildConfig.DEBUG) return
+        val clipboard = container.appContext
+            .getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            ?: return
+        clipboard.setPrimaryClip(ClipData.newPlainText("PixelMind diagnostics", diagnosticsDump()))
+        _message.value = "Diagnostics copied to the clipboard."
+    }
+
+    /** The dump itself, kept separate from the clipboard so its contents can be asserted. */
+    internal fun diagnosticsDump(): String {
+        val info = modelInfo.value
+        val status = engineStatus.value
+        val hw = hardware.value
+        val guard = container.memoryGuard
+        val t = lastTimings.value
+        return buildString {
+            appendLine("PixelMind ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
+            appendLine("Device: ${hw.device}")
+            appendLine("ABIs: ${hw.abis} · cores: ${hw.cores}")
+            appendLine("Engine: ${describe(status)}")
+            appendLine("Accelerator: ${(status as? EngineStatus.Ready)?.accelerator ?: "not loaded"}")
+            if (info != null) {
+                appendLine("Model: ${info.name} ${info.version} · ${info.architecture} · ${info.precision}")
+                appendLine("Weights: ${info.bytesOnDisk / 1_048_576} MB")
+            } else {
+                appendLine("Model: none loaded")
+            }
+            appendLine(
+                "RAM: ${guard.totalRamMb} MB total, ${guard.availableRamMb} MB free · " +
+                    "heap class ${hw.memoryClassMb} MB · low-RAM: ${if (hw.isLowRam) "yes" else "no"}"
+            )
+            if (t != null) {
+                appendLine(
+                    "Last run: ${t.width}x${t.height}, ${t.steps} steps · prompt ${t.textEncodeMs} ms · " +
+                        "diffusion ${t.diffusionMs} ms (${t.perStepMs} ms/step) · decode ${t.decodeMs} ms · " +
+                        "total ${t.totalMs} ms on ${t.accelerator}"
+                )
+            } else {
+                appendLine("Last run: none this session")
+            }
+        }
     }
 
     // ---- settings -------------------------------------------------------------------------
