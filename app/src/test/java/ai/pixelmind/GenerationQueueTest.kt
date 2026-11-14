@@ -22,8 +22,10 @@ import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -78,6 +80,8 @@ class GenerationQueueTest {
      */
     private inner class FakeEngine(
         initialStatus: EngineStatus,
+        /** What [initialize] settles on. Defaults to a ready engine. */
+        private val initResult: EngineStatus = ready,
         private val initDelayMs: Long = 0L,
         private val swallowCancellation: Boolean = false,
         private val body: suspend (GenerationRequest, (GenerationProgress) -> Unit) -> GenerationResult =
@@ -97,8 +101,8 @@ class GenerationQueueTest {
         override suspend fun initialize(): EngineStatus {
             initialiseCalls.incrementAndGet()
             if (initDelayMs > 0) delay(initDelayMs)
-            liveStatus = ready
-            return ready
+            liveStatus = initResult
+            return initResult
         }
 
         override fun status(): EngineStatus = liveStatus
@@ -286,6 +290,65 @@ class GenerationQueueTest {
             GenerationManager.JobState.CANCELLED,
             manager.jobs.value.single().state
         )
+    }
+
+    @Test
+    fun `a cancellation produces no result event for the UI to toast`() {
+        val engine = FakeEngine(ready, body = { req, onProgress ->
+            repeat(50) { step ->
+                delay(20)
+                onProgress(GenerationProgress(GenerationStage.DIFFUSING, step, 50, 0L))
+            }
+            ok(req)
+        })
+        val manager = GenerationManager(engine, FakeRecorder(), scope)
+        manager.start()
+
+        manager.enqueue(request("a quiet street"))
+        awaitTrue("the worker to enter the engine") { engine.runs.get() == 1 }
+        manager.cancelActive()
+        awaitTrue("the job to settle") { manager.jobs.value.single().state.isTerminal }
+
+        // Nothing may arrive on the result channel: the ViewModel shows a snackbar for whatever
+        // comes through it, and a cancel the user asked for is not something to announce twice.
+        val event = runBlocking { withTimeoutOrNull(1_000) { manager.resultEvents.first() } }
+        assertNull("cancellation must not raise a message", event)
+        assertEquals(GenerationManager.JobState.CANCELLED, manager.jobs.value.single().state)
+    }
+
+    @Test
+    fun `a failure caused by missing weights is not offered for retry`() {
+        val engine = FakeEngine(
+            initialStatus = EngineStatus.Uninitialised,
+            initResult = EngineStatus.WeightsMissing("no weights are installed")
+        )
+        val manager = GenerationManager(engine, FakeRecorder(), scope)
+        manager.start()
+
+        val id = manager.enqueue(request("a hill"))
+        awaitTrue("the job to fail") { manager.jobs.value.single().state.isTerminal }
+
+        val job = manager.jobs.value.single()
+        assertEquals(GenerationManager.JobState.FAILED, job.state)
+        assertFalse("nothing to retry without weights", job.retryable)
+
+        manager.retry(id)
+        Thread.sleep(100)
+        assertEquals("retry must not re-run a job that cannot succeed", 0, engine.runs.get())
+    }
+
+    @Test
+    fun `an ordinary generation failure stays retryable`() {
+        val engine = FakeEngine(ready, body = { _, _ -> GenerationResult.Failed("the UNet failed") })
+        val manager = GenerationManager(engine, FakeRecorder(), scope)
+        manager.start()
+
+        manager.enqueue(request("a tower"))
+        awaitTrue("the job to fail") { manager.jobs.value.single().state.isTerminal }
+
+        val job = manager.jobs.value.single()
+        assertEquals(GenerationManager.JobState.FAILED, job.state)
+        assertTrue("a second attempt may succeed", job.retryable)
     }
 
     @Test
