@@ -54,11 +54,20 @@ class GenerationManager(
         val isTerminal: Boolean get() = this == SUCCEEDED || this == FAILED || this == CANCELLED
     }
 
+    /**
+     * One queued request.
+     *
+     * [retryable] is part of the job because the failure card offered Retry for every failed job,
+     * including the ones that cannot possibly succeed — with no weights installed, re-running the
+     * same request fails the same way a second later. The flag is set where the failure is
+     * classified, which is the only place that knows why it happened.
+     */
     data class Job(
         val id: Long,
         val request: GenerationRequest,
         val state: JobState,
-        val message: String? = null
+        val message: String? = null,
+        val retryable: Boolean = true
     )
 
     private val _engineStatus = MutableStateFlow<EngineStatus>(EngineStatus.Uninitialised)
@@ -181,6 +190,9 @@ class GenerationManager(
         synchronized(queueLock) {
             val job = _jobs.value.firstOrNull { it.id == jobId } ?: return
             if (!job.state.isTerminal) return
+            // A job that failed because there is nothing to load is not re-runnable: it would
+            // fail identically, and the Retry button no longer offers it.
+            if (!job.retryable) return
             if (!pending.add(jobId)) return
             _jobs.update { list ->
                 list.map {
@@ -270,7 +282,9 @@ class GenerationManager(
                     "The local engine is not running. Open the app again to reload the model."
                 is EngineStatus.Ready -> "The local engine is not ready."
             }
-            finishJob(job.id, JobState.FAILED, reason)
+            // Nothing installed is the one failure a retry cannot fix — the weights have to be
+            // provisioned or imported first. Everything else may recover on a second attempt.
+            finishJob(job.id, JobState.FAILED, reason, retryable = status !is EngineStatus.WeightsMissing)
             _progress.value = null
             results.trySend(GenerationResult.Failed(reason))
             return
@@ -354,11 +368,19 @@ class GenerationManager(
      * The guard is what stops a cancelled job being relabelled: cancellation marks the job while
      * the engine is still unwinding, and the result that arrives afterwards must not overwrite it.
      */
-    private fun finishJob(id: Long, state: JobState, message: String? = null) {
+    private fun finishJob(
+        id: Long,
+        state: JobState,
+        message: String? = null,
+        retryable: Boolean = true
+    ) {
         _jobs.update { list ->
             list.map {
-                if (it.id == id && !it.state.isTerminal) it.copy(state = state, message = message)
-                else it
+                if (it.id == id && !it.state.isTerminal) {
+                    it.copy(state = state, message = message, retryable = retryable)
+                } else {
+                    it
+                }
             }
         }
     }
