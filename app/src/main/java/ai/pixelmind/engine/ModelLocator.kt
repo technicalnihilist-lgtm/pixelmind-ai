@@ -25,10 +25,25 @@ class ModelLocator(private val context: Context) {
 
     data class Located(val dir: File, val manifest: ModelManifest)
 
+    /**
+     * What is on disk, in three states the user can tell apart.
+     *
+     * They used to be two — "missing" and "corrupt" — and an unreadable manifest was reported as
+     * corruption. That sent a user whose `model_manifest.json` was half-written by a killed
+     * process to the same advice as a truncated graph, even though nothing had to be downloaded or
+     * re-imported: the manifest itself simply had to be read again, or restored.
+     */
     sealed interface Resolution {
         data class Available(val located: Located) : Resolution
+
+        /** Nothing is installed: no manifest, and the bundled copy could not be provisioned. */
         data class Missing(val detail: String) : Resolution
+
+        /** The files are there but a component is truncated, altered or absent. */
         data class Corrupt(val detail: String) : Resolution
+
+        /** The files are there but cannot be read at all — an I/O error or unparseable JSON. */
+        data class Unreadable(val detail: String) : Resolution
     }
 
     fun resolve(): Resolution {
@@ -38,13 +53,13 @@ class ModelLocator(private val context: Context) {
             if (!provisioned.isNullOrBlank()) return Resolution.Missing(provisioned)
         }
         if (!manifestFile.exists()) {
-            return Resolution.Missing(
-                "No model weights are installed. Build the weights with tools/export_model.py " +
-                    "and place them in modelpack/src/main/assets/models."
-            )
+            return Resolution.Missing(ModelMessages.ABSENT)
+        }
+        if (!manifestFile.canRead() || manifestFile.length() == 0L) {
+            return Resolution.Unreadable(ModelMessages.EMPTY_MANIFEST)
         }
         var manifest = readManifest(manifestFile)
-            ?: return Resolution.Corrupt("model_manifest.json is unreadable.")
+            ?: return Resolution.Unreadable(ModelMessages.BAD_MANIFEST)
 
         var problem = verifyComponents(manifest)
         if (problem != null) {
@@ -57,7 +72,7 @@ class ModelLocator(private val context: Context) {
                 return Resolution.Corrupt("$problem. $repair")
             }
             manifest = readManifest(manifestFile)
-                ?: return Resolution.Corrupt("model_manifest.json is unreadable after repair.")
+                ?: return Resolution.Unreadable(ModelMessages.BAD_MANIFEST_AFTER_REPAIR)
             problem = verifyComponents(manifest)
             if (problem != null) return Resolution.Corrupt(problem)
             Log.i(TAG, "Model files repaired from the bundled copy")
@@ -116,7 +131,9 @@ class ModelLocator(private val context: Context) {
             null
         } catch (t: Throwable) {
             Log.e(TAG, "Provisioning failed", t)
-            "Could not prepare model files: ${t.message ?: t.javaClass.simpleName}"
+            // Mapped, not concatenated: a provisioning failure is usually an IOException whose
+            // message is an absolute path, which has no place on the failure card.
+            "Could not prepare the model files. ${describeFailure(t)}"
         }
     }
 
@@ -134,7 +151,7 @@ class ModelLocator(private val context: Context) {
         var dirty = false
         for (component in manifest.components) {
             val file = File(modelDir, component.file)
-            if (!file.exists()) return "Missing component: ${component.file}"
+            if (!file.exists()) return ModelMessages.missingComponent(component.file)
             if (component.sha256.isBlank()) continue
 
             val length = file.length()
@@ -152,7 +169,7 @@ class ModelLocator(private val context: Context) {
             if (!actual.equals(component.sha256, ignoreCase = true)) {
                 cache.remove(component.file)
                 saveVerified(cache)
-                return "Checksum mismatch for ${component.file}"
+                return ModelMessages.checksumMismatch(component.file)
             }
             cache[component.file] = Verified(component.file, length, modified, component.sha256)
             dirty = true
@@ -252,4 +269,40 @@ internal fun writeModelFile(modelDir: File, relativePath: String, input: java.io
         throw t
     }
     return target
+}
+
+
+/**
+ * The sentences for the three states a model tree can be in, kept together so they cannot drift
+ * into each other.
+ *
+ * "Absent", "unreadable" and "damaged" need different advice: the first needs weights, the second
+ * needs the manifest restored, and only the third needs the weights themselves re-imported. Before
+ * this, an unreadable manifest was reported as damage, which told a user whose manifest had been
+ * half-written by a killed process to do work they did not need to do.
+ */
+internal object ModelMessages {
+
+    const val ABSENT =
+        "No model weights are installed. Build the weights with tools/export_model.py and place " +
+            "them in modelpack/src/main/assets/models."
+
+    const val EMPTY_MANIFEST =
+        "The model's manifest could not be read: the file is empty or not accessible. Reinstall " +
+            "the app to restore the bundled model."
+
+    const val BAD_MANIFEST =
+        "The model's manifest could not be read: it is not valid JSON. Reinstall the app to " +
+            "restore the bundled model."
+
+    const val BAD_MANIFEST_AFTER_REPAIR =
+        "The model's manifest could not be read after a repair attempt: it is not valid JSON. " +
+            "Reinstall the app to restore the bundled model."
+
+    fun missingComponent(file: String): String =
+        "The model is damaged: $file is missing from the installed set. Reimport the model."
+
+    fun checksumMismatch(file: String): String =
+        "The model is damaged: $file does not match its checksum, so it is truncated or was " +
+            "modified. Reimport the model."
 }
