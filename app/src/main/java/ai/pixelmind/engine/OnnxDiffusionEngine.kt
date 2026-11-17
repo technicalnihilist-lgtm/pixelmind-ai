@@ -1,8 +1,10 @@
 package ai.pixelmind.engine
 
+import ai.onnxruntime.NodeInfo
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
 import ai.pixelmind.util.ImageStore
 import android.content.Context
 import android.graphics.Bitmap
@@ -208,6 +210,25 @@ class OnnxDiffusionEngine(
             }
         }
         lastError?.let { throw it }
+
+        // A session that opens is not yet a session that fits this pipeline. Checked after the
+        // accelerator has been chosen, so a mismatch fails the load once instead of three times,
+        // and before the import is allowed to stand: this is what turns "the imported model loads
+        // but generates garbage" into a failed load and a rollback to the previous model.
+        val encoderSession = textEncoder
+        val unetSessionOpen = unet
+        val vaeSessionOpen = vaeDecoder
+        if (encoderSession == null || unetSessionOpen == null || vaeSessionOpen == null) {
+            throw IllegalStateException("The model sessions were not created.")
+        }
+        TensorContract.check(
+            m,
+            listOf(
+                openedSession(GraphName.TEXT_ENCODER, encoderSession),
+                openedSession(GraphName.UNET, unetSessionOpen),
+                openedSession(GraphName.VAE_DECODER, vaeSessionOpen)
+            )
+        )?.let { throw GraphFailure(it.graph, it.reason) }
 
         // Parsed by the first generation, not here: see TokenizerLoader.
         tokenizerLoader = TokenizerLoader(
@@ -743,6 +764,20 @@ class OnnxDiffusionEngine(
         val unet: OrtSession,
         val vaeDecoder: OrtSession
     )
+
+    /**
+     * What a session reports about itself, in the shape [TensorContract] compares against.
+     *
+     * Only shapes are read, and only tensor inputs and outputs: an initializer or a sequence is
+     * not part of the contract, and a graph that reports no shape at all (a dynamic rank) is left
+     * to the pipeline, which already handles it.
+     */
+    private fun openedSession(graph: GraphName, session: OrtSession): TensorContract.Opened {
+        fun shapes(info: Map<String, NodeInfo>): Map<String, LongArray> = info.mapValues { (_, node) ->
+            (node.info as? TensorInfo)?.shape ?: LongArray(0)
+        }
+        return TensorContract.Opened(graph, shapes(session.inputInfo), shapes(session.outputInfo))
+    }
 
     /**
      * Opens one graph and logs how long it took.
