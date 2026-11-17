@@ -47,6 +47,13 @@ class ModelLocator(private val context: Context) {
     }
 
     fun resolve(): Resolution {
+        // An import killed between its two renames leaves `models` absent and the user's tree in
+        // `models.previous`. Without this the missing directory was provisioned from the bundle
+        // and the imported weights were dropped silently — the process dying undoing the import.
+        if (ModelSwap.recover(modelDir, File(context.filesDir, ModelSwap.PREVIOUS))) {
+            Log.i(TAG, "Restored the previous model after an interrupted import")
+            runCatching { verifiedFile.delete() }
+        }
         val manifestFile = File(modelDir, ModelManifest.FILE_NAME)
         if (!manifestFile.exists()) {
             val provisioned = provisionFromBundle(force = false)
