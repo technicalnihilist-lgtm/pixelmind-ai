@@ -27,6 +27,14 @@ with shapes chosen to match the Kotlin engine exactly:
 | unet | `sample` [1,4,H/8,W/8], `timestep` [1], `encoder_hidden_states` [1,77,768] | `out_sample` [1,4,H/8,W/8] |
 | vae_decoder | `latent_sample` [1,4,H/8,W/8] | `sample` [1,3,H,W] |
 
+The types are part of the contract, not just the shapes. Every input is float32 except the two
+token ids and the UNet's timestep, which are int64; the decoder's three output planes are
+**R, G, B** in that order, which is what `ImageChannels.packRgb` reads and what
+`tools/export_model.py` writes (it converts the pipeline's RGB output straight to a tensor and
+adds no flip). `TensorContract` checks the graph's declared shapes *and* the timestep's declared
+type when a model is imported, so a re-export with a float timestep is refused at import rather
+than failing on the first step of the first generation.
+
 Three details that make untrained weights produce a presentable image rather than RGB static,
 all documented in the script: padding tokens are masked before pooling (otherwise every prompt
 conditions identically), the decoder pools the latent 8x before decoding (untrained weights have

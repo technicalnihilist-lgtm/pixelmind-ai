@@ -11,8 +11,9 @@ package ai.pixelmind.engine
  *
  * The check is deliberately narrow. It looks only at what the Kotlin pipeline hard-codes: the input
  * names it feeds by position, the output name it reads, the 768-wide text embedding, the
- * 4-channel latent and the 3-channel decoder output. Dynamic dimensions (-1) are left alone,
- * because the pipeline runs several resolutions and aspect ratios through the same graphs.
+ * 4-channel latent, the 3-channel decoder output and the int64 scalar timestep. Dynamic
+ * dimensions (-1) are left alone, because the pipeline runs several resolutions and aspect ratios
+ * through the same graphs.
  *
  * Nothing here is measured on a device: it is a comparison between the manifest and what the
  * session reports about itself.
@@ -25,11 +26,17 @@ internal object TensorContract {
     /** The decoder's output channels: the PNG writer reads R, G and B, in that order. */
     const val RGB_CHANNELS = 3L
 
-    /** What one opened session reports: input and output names, and their shapes. */
+    /**
+     * What one opened session reports: input and output names, their shapes, and each input's
+     * element type as ONNX Runtime names it (`FLOAT`, `INT64`, ...). Types default to empty
+     * because a shape alone was all this used to read; a graph whose types are unknown is left
+     * to fail at run time exactly as before.
+     */
     data class Opened(
         val graph: GraphName,
         val inputs: Map<String, LongArray>,
-        val outputs: Map<String, LongArray>
+        val outputs: Map<String, LongArray>,
+        val inputTypes: Map<String, String> = emptyMap()
     )
 
     data class Violation(val graph: GraphName, val reason: String)
@@ -81,6 +88,7 @@ internal object TensorContract {
                     "${m.latentChannels}"
             )
         }
+        checkTimestep(o, spec)?.let { return Violation(graph, it) }
         val conditioning = dim(o.inputs.getValue(spec.inputNames[2]), 2)
         if (conditioning != null && conditioning != HIDDEN_SIZE) {
             return Violation(
@@ -96,6 +104,34 @@ internal object TensorContract {
                 "it predicts $outChannels-channel latents, but the manifest declares " +
                     "${m.latentChannels}"
             )
+        }
+        return null
+    }
+
+    /**
+     * The timestep is the one input that is not float: the graph takes a single int64 value.
+     *
+     * A UNet re-exported with a float timestep — or one that expects a whole batch of them —
+     * opens cleanly and then fails inside ONNX Runtime on the first step, with a type error that
+     * names no input. Caught here, at import, where the message can say which input and why.
+     */
+    private fun checkTimestep(o: Opened, spec: ModelManifest.GraphSpec): String? {
+        val name = spec.inputNames.getOrNull(1) ?: return null
+        val declared = o.inputTypes[name]
+        if (declared != null && !declared.equals(TimestepInput.DTYPE, ignoreCase = true)) {
+            return "its timestep input `$name` is $declared, but the pipeline feeds a single " +
+                "${TimestepInput.DTYPE} value, so every step would fail on the type"
+        }
+        val shape = o.inputs[name]
+        if (shape != null && shape.isNotEmpty()) {
+            if (shape.size != 1) {
+                return "its timestep input `$name` is rank ${shape.size}, but the pipeline feeds " +
+                    "a single value"
+            }
+            if (shape[0] > 1) {
+                return "its timestep input `$name` expects ${shape[0]} timesteps per call, but " +
+                    "the pipeline feeds one"
+            }
         }
         return null
     }

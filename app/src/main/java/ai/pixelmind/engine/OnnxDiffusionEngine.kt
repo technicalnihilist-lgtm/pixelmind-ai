@@ -19,7 +19,6 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
-import java.util.Random
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.CoroutineContext
 import kotlin.math.min
@@ -444,12 +443,14 @@ class OnnxDiffusionEngine(
             val textStarted = SystemClock.elapsedRealtime()
             // Parsed here, on the first generation, and reused by every later one.
             val tokenizer = sessions.tokenizerLoader.get()
+            // Which string goes to which pass is decided in PromptComposition, not here: the
+            // negative prompt belongs to the unconditional pass only.
             val condEmbedding = runTextEncoder(
-                env, sessions.textEncoder, m, tokenizer, fitted.conditionalText()
+                env, sessions.textEncoder, m, tokenizer, PromptComposition.conditional(fitted)
             )
             val uncondEmbedding = if (fitted.guidance > 1.05f) {
                 runTextEncoder(
-                    env, sessions.textEncoder, m, tokenizer, fitted.negativePrompt.trim()
+                    env, sessions.textEncoder, m, tokenizer, PromptComposition.unconditional(fitted)
                 )
             } else null
             val textDone = SystemClock.elapsedRealtime()
@@ -457,9 +458,9 @@ class OnnxDiffusionEngine(
 
             val timesteps = scheduler.timesteps(fitted.steps)
             val latent = buffers.latent
-            val rng = Random(seed)
-            val scale = scheduler.initialNoiseScale(timesteps[0]).toFloat()
-            for (i in latent.indices) latent[i] = rng.nextGaussian().toFloat() * scale
+            // Seeded gaussian noise, scaled to the schedule's first step. LatentNoise is the only
+            // place the initial latent is written, so the seed means the same thing everywhere.
+            LatentNoise.fill(latent, seed, scheduler.initialNoiseScale(timesteps[0]).toFloat())
 
             // Every buffer the loop touches is allocated once, above, and reused by every step:
             // `scaled` is the VAE-scaled copy the UNet reads, and the two eps buffers are filled
@@ -479,8 +480,7 @@ class OnnxDiffusionEngine(
                         env, sessions.unet, m, latent, buffers.scaled, t, latentH, latentW,
                         uncondEmbedding, epsUncond
                     )
-                    val g = fitted.guidance
-                    for (i in eps.indices) eps[i] = epsUncond[i] + g * (eps[i] - epsUncond[i])
+                    ClassifierFreeGuidance.blend(eps, epsUncond, fitted.guidance)
                 }
                 native.step(latent, eps, t, prev, scheduler)
                 stepIndex += 1
@@ -597,7 +597,8 @@ class OnnxDiffusionEngine(
     ) = inGraph(GraphName.UNET) {
         require(scaled.size == latent.size) { "scratch buffer must match the latent size" }
         require(dest.size == latent.size) { "output buffer must match the latent size" }
-        for (i in latent.indices) scaled[i] = latent[i] * LcmScheduler.LATENT_SCALE
+        // Once, here: the UNet reads the scaled space and the sampler works in the unscaled one.
+        LatentScale.toModel(latent, scaled)
         val inputs = HashMap<String, OnnxTensor>()
         try {
             inputs[m.unet.inputNames.getOrElse(0) { "sample" }] = OnnxTensor.createTensor(
@@ -605,10 +606,11 @@ class OnnxDiffusionEngine(
                 FloatBuffer.wrap(scaled),
                 longArrayOf(1, m.latentChannels.toLong(), latentH.toLong(), latentW.toLong())
             )
+            // int64, shape [1]: the dtype and the shape the graph declares, from one place.
             inputs[m.unet.inputNames.getOrElse(1) { "timestep" }] = OnnxTensor.createTensor(
                 env,
-                LongBuffer.wrap(longArrayOf(timestep.toLong())),
-                longArrayOf(1)
+                LongBuffer.wrap(TimestepInput.values(timestep)),
+                TimestepInput.SHAPE
             )
             inputs[m.unet.inputNames.getOrElse(2) { "encoder_hidden_states" }] = OnnxTensor.createTensor(
                 env,
@@ -673,7 +675,8 @@ class OnnxDiffusionEngine(
     ): Bitmap = inGraph(GraphName.VAE_DECODER) {
         val latent = buffers.latent
         val unscaled = buffers.decodeScratch
-        for (i in latent.indices) unscaled[i] = latent[i] / LcmScheduler.LATENT_SCALE
+        // The mirror of the scaling in runUnet: divided exactly once, here.
+        LatentScale.fromModel(latent, unscaled)
 
         val plane = width * height
         // Nothing below can be interrupted once the decoder starts, so the last chance to give
@@ -695,27 +698,18 @@ class OnnxDiffusionEngine(
                 // a different VAE scale factor produces a differently sized buffer, and indexing
                 // it blindly crashed the process with an ArrayIndexOutOfBounds instead of
                 // reporting the mismatch.
-                if (pixels.remaining() < plane * 3) {
+                if (pixels.remaining() < plane * ImageChannels.CHANNELS) {
                     throw IllegalStateException(
                         "VAE decoder returned ${pixels.remaining()} values for a ${width}x$height " +
-                            "image (expected ${plane * 3}). This model's VAE does not match the 8x " +
-                            "latent grid."
+                            "image (expected ${plane * ImageChannels.CHANNELS}). This model's VAE " +
+                            "does not match the 8x latent grid."
                     )
                 }
-                for (i in 0 until plane) {
-                    val r = toByte(pixels.get(base + i))
-                    val g = toByte(pixels.get(base + plane + i))
-                    val b = toByte(pixels.get(base + 2 * plane + i))
-                    argb[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                }
+                // Plane order is R, G, B — the contract the export and TensorContract agree on.
+                ImageChannels.packRgb(pixels, base, plane, argb)
             }
         }
         Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888)
-    }
-
-    private fun toByte(value: Float): Int {
-        val normalised = (value * 0.5f + 0.5f).coerceIn(0f, 1f)
-        return (normalised * 255f + 0.5f).toInt()
     }
 
     override suspend fun release() {
@@ -776,7 +770,17 @@ class OnnxDiffusionEngine(
         fun shapes(info: Map<String, NodeInfo>): Map<String, LongArray> = info.mapValues { (_, node) ->
             (node.info as? TensorInfo)?.shape ?: LongArray(0)
         }
-        return TensorContract.Opened(graph, shapes(session.inputInfo), shapes(session.outputInfo))
+        // The element type travels with the shape: the timestep input has to be int64, and that
+        // is only visible here.
+        fun types(info: Map<String, NodeInfo>): Map<String, String> = info.mapValues { (_, node) ->
+            (node.info as? TensorInfo)?.type?.name ?: ""
+        }
+        return TensorContract.Opened(
+            graph,
+            shapes(session.inputInfo),
+            shapes(session.outputInfo),
+            types(session.inputInfo)
+        )
     }
 
     /**
@@ -833,16 +837,6 @@ class OnnxDiffusionEngine(
         EngineStatus.Uninitialised ->
             "The local engine is not running. Open the app again to reload the model."
         is EngineStatus.Ready -> "The local engine is not ready."
-    }
-
-    /**
-     * The prompt the text encoder sees for the conditional pass: the user's words plus the
-     * style's photographic/art direction. The negative prompt is *not* appended here — it forms
-     * the unconditional pass instead, which is what classifier-free guidance subtracts.
-     */
-    private fun GenerationRequest.conditionalText(): String = buildString {
-        append(prompt.trim())
-        if (style.promptSuffix.isNotBlank()) append(", ").append(style.promptSuffix)
     }
 
     private companion object {

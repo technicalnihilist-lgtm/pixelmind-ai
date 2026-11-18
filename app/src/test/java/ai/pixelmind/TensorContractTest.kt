@@ -49,7 +49,8 @@ class TensorContractTest {
         conditioning: Long = 768,
         rgb: Long = 3,
         unetInputs: Map<String, LongArray>? = null,
-        vaeOutputs: Map<String, LongArray>? = null
+        vaeOutputs: Map<String, LongArray>? = null,
+        unetInputTypes: Map<String, String>? = null
     ) = listOf(
         TensorContract.Opened(
             GraphName.TEXT_ENCODER,
@@ -63,7 +64,12 @@ class TensorContractTest {
                 "timestep" to longArrayOf(1),
                 "encoder_hidden_states" to longArrayOf(1, 77, conditioning)
             ),
-            outputs = mapOf("out_sample" to longArrayOf(1, latentChannels, -1, -1))
+            outputs = mapOf("out_sample" to longArrayOf(1, latentChannels, -1, -1)),
+            inputTypes = unetInputTypes ?: mapOf(
+                "sample" to "FLOAT",
+                "timestep" to "INT64",
+                "encoder_hidden_states" to "FLOAT"
+            )
         ),
         TensorContract.Opened(
             GraphName.VAE_DECODER,
@@ -180,5 +186,60 @@ class TensorContractTest {
 
         assertTrue(ModelSwap.rollback(root, previous))
         assertEquals("previous weights", File(root, "unet/model.onnx").readText())
+    }
+
+    @Test
+    fun `a unet whose timestep input is float is rejected by name`() {
+        // Every other input is float, so a float timestep is the mistake that actually gets made;
+        // ONNX Runtime then fails on the first step with a type error that names no input.
+        val violation = TensorContract.check(
+            manifest(),
+            shipped(unetInputTypes = mapOf("sample" to "FLOAT", "timestep" to "FLOAT", "encoder_hidden_states" to "FLOAT"))
+        )
+        assertNotNull(violation)
+        assertEquals(GraphName.UNET, violation!!.graph)
+        assertTrue(violation.reason, violation.reason.contains("timestep"))
+        assertTrue(violation.reason, violation.reason.contains("FLOAT"))
+        assertTrue(violation.reason, violation.reason.contains("INT64"))
+    }
+
+    @Test
+    fun `a unet that expects a batch of timesteps is rejected`() {
+        val violation = TensorContract.check(
+            manifest(),
+            shipped(
+                unetInputs = mapOf(
+                    "sample" to longArrayOf(1, 4, -1, -1),
+                    "timestep" to longArrayOf(2),
+                    "encoder_hidden_states" to longArrayOf(1, 77, 768)
+                )
+            )
+        )
+        assertNotNull(violation)
+        assertEquals(GraphName.UNET, violation!!.graph)
+        assertTrue(violation.reason, violation.reason.contains("2 timesteps"))
+    }
+
+    @Test
+    fun `a rank-two timestep input is rejected`() {
+        val violation = TensorContract.check(
+            manifest(),
+            shipped(
+                unetInputs = mapOf(
+                    "sample" to longArrayOf(1, 4, -1, -1),
+                    "timestep" to longArrayOf(1, 1),
+                    "encoder_hidden_states" to longArrayOf(1, 77, 768)
+                )
+            )
+        )
+        assertNotNull(violation)
+        assertTrue(violation!!.reason, violation.reason.contains("rank 2"))
+    }
+
+    @Test
+    fun `a graph whose types are unknown is still judged on its shapes`() {
+        // Sessions report types today, but a shape-only report must not turn into a false failure.
+        val violation = TensorContract.check(manifest(), shipped(unetInputTypes = emptyMap()))
+        assertNull(violation)
     }
 }

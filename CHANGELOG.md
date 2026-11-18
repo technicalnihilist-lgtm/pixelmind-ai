@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.6.0 — inference correctness (Day 8 of the optimisation backlog)
+
+Maintenance release. No UI, feature, model-format or permission changes; the app still declares no
+platform permissions and no `INTERNET`. Every change is in the arithmetic between the graphs, and
+two of them change what a generation produces.
+
+* **The last scheduler step actually denoises.** `LcmScheduler.step` fed the LCM boundary-condition
+  blend — a *denoised* estimate of x0 — into a DDIM update that expects a *noise* estimate. At the
+  final step, where `alpha_prev == 1`, that returns the input latent unchanged, so the last step of
+  every generation was a no-op. The step is now the reference order: recover x0 from the UNet's
+  epsilon prediction, apply the boundary conditions, then take the deterministic DDIM step.
+* **`c_skip` and `c_out` are evaluated where LCM-LoRA defines them.** Both were computed from the
+  DDPM noise level, which at t=999 is 14.6, giving `c_out ~ 0.5` — every step's denoised estimate
+  was half the model's prediction. At the reference's `t * 10` scaling they are ~1 and ~0, which is
+  what the distillation was trained against. `LcmSchedulerTest` now pins the coefficients, the
+  schedules and full 4/6/8-step chains against an independent implementation of the reference
+  formulas.
+* **The tokenizer is checked against real CLIP ids.** The old tests used a hand-built eight-token
+  vocabulary, which proved the framing but not that the port agrees with CLIP. A new fixture holds
+  reference vectors produced by the canonical CLIP BPE over the real `vocab.json`/`merges.txt`, and
+  the test asserts exact ids for nine prompts including punctuation, digits and a non-ASCII word.
+* **A UNet with a float timestep is refused at import.** `TensorContract` now reads each input's
+  declared element type as well as its shape: the timestep must be int64 and a single value, and a
+  graph that expects a batch of them is rejected with a sentence naming the input. Previously this
+  opened cleanly and failed inside ONNX Runtime on the first step.
+* **The pure arithmetic of a pass has one home.** Guidance blending, the 0.18215 scaling, the
+  seeded noise, the decoder's R/G/B packing and the prompt composition moved out of
+  `OnnxDiffusionEngine` into testable objects (`ClassifierFreeGuidance`, `LatentScale`,
+  `LatentNoise`, `ImageChannels`, `TimestepInput`, `PromptComposition`). None of it needs a session,
+  so all of it is now covered on the JVM — including a 64x64 golden image over the whole chain
+  whose pixels come from a separate reference implementation.
+* **`PromptComposition` states which string reaches which pass.** The conditional text is the prompt
+  plus the style suffix and never the negative prompt; the unconditional text is the negative prompt
+  and nothing else. Tests cover the leak in both directions.
+
+**Tests** — 206 unit tests (was 159). **Not verified:** image quality after the two sampler fixes.
+Both change the numbers the UNet sees, and judging whether the result is better needs a device with
+the real weights; no emulator or device was available to this run.
+
 ## 1.4.0 — I/O and storage (Day 5 of the optimisation backlog)
 
 Maintenance release. No UI, feature, model-format or permission changes; the app still declares no
